@@ -65,19 +65,36 @@ import (
 	"github.com/coze-dev/coze-studio/backend/types/errno"
 )
 
+// ApplicationService 工作流应用层服务
+// 负责协调工作流相关的业务逻辑，处理API请求，调用领域服务
+// 作为控制器层和领域层之间的桥梁，处理参数转换、权限验证、错误处理等
 type ApplicationService struct {
-	DomainSVC   workflowDomain.Service
-	ImageX      imagex.ImageX // we set Imagex here, because Imagex is used as a proxy to get auth token, there is no actual correlation with the workflow domain.
-	TosClient   storage.Storage
-	IDGenerator idgen.IDGenerator
+	DomainSVC   workflowDomain.Service // 工作流领域服务，处理核心业务逻辑
+	ImageX      imagex.ImageX          // 图片服务代理，用于获取认证令牌，与工作流领域无直接关联
+	TosClient   storage.Storage        // 对象存储客户端，用于文件上传下载
+	IDGenerator idgen.IDGenerator      // ID生成器，用于生成唯一标识符
 }
 
 var SVC = &ApplicationService{}
 
+// GetWorkflowDomainSVC 获取工作流领域服务实例
+// 提供全局访问工作流领域服务的便捷方法
+// 返回值: domainWorkflow.Service - 工作流领域服务接口
 func GetWorkflowDomainSVC() domainWorkflow.Service {
 	return SVC.DomainSVC
 }
 
+// GetNodeTemplateList 获取工作流节点模板列表
+// 返回系统支持的所有节点类型的模板信息，包括节点的名称、描述、图标等
+// 用于前端画布中显示可用的节点类型供用户选择
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息和国际化语言设置
+//   - req: 节点模板列表请求参数
+//
+// 返回值:
+//   - NodeTemplateListResponse: 包含所有可用节点模板的响应
+//   - error: 处理过程中的错误信息
 func (w *ApplicationService) GetNodeTemplateList(ctx context.Context, req *workflow.NodeTemplateListRequest) (
 	_ *workflow.NodeTemplateListResponse, err error,
 ) {
@@ -151,74 +168,154 @@ func (w *ApplicationService) GetNodeTemplateList(ctx context.Context, req *workf
 	return resp, nil
 }
 
+// CreateWorkflow 创建工作流的核心业务逻辑实现
+// 该函数负责处理工作流创建的完整流程，包括权限验证、数据构建、持久化等操作
+//
+// 参数说明:
+//   - ctx: 请求上下文，包含用户会话信息、请求跟踪ID、超时控制等
+//   - req: 创建工作流的请求参数，包含工作流名称、描述、空间ID、项目ID等
+//
+// 返回值:
+//   - CreateWorkflowResponse: 创建成功的响应，包含新工作流的ID和相关信息
+//   - error: 创建过程中发生的错误，已经过统一包装处理
 func (w *ApplicationService) CreateWorkflow(ctx context.Context, req *workflow.CreateWorkflowRequest) (
 	_ *workflow.CreateWorkflowResponse, err error,
 ) {
+	// 1. 错误恢复和统一错误包装处理
+	// 使用defer确保在函数退出时进行统一的错误处理，提供一致的错误格式
 	defer func() {
+		// 捕获panic异常，防止程序崩溃，提高系统稳定性
 		if panicErr := recover(); panicErr != nil {
+			// 将panic转换为标准错误格式，并包含完整的堆栈信息用于问题排查
 			err = safego.NewPanicErr(panicErr, debug.Stack())
 		}
 
+		// 统一包装所有错误为工作流操作失败的业务错误
+		// 这样客户端可以得到一致的错误响应格式
 		if err != nil {
 			err = vo.WrapIfNeeded(errno.ErrWorkflowOperationFail, err, errorx.KV("cause", vo.UnwrapRootErr(err).Error()))
 		}
 	}()
 
+	// 2. 用户身份验证和提取
+	// 从请求上下文中获取当前登录用户的ID
+	// MustGet系列函数表示如果获取不到会panic，确保调用前已完成用户认证
 	uID := ctxutil.MustGetUIDFromCtx(ctx)
+
+	// 3. 空间权限验证
+	// 将字符串格式的空间ID转换为int64类型，用于后续的数据库操作
 	spaceID := mustParseInt64(req.GetSpaceID())
+	// 验证当前用户是否有权限在指定的工作空间中创建工作流
+	// 这是重要的权限控制检查，防止越权操作
 	if err := checkUserSpace(ctx, uID, spaceID); err != nil {
 		return nil, err
 	}
+
+	// 4. 构建工作流创建元数据
+	// 将请求参数转换为领域层需要的数据结构
 	wf := &vo.MetaCreate{
-		CreatorID:        uID,
-		SpaceID:          spaceID,
-		ContentType:      workflow.WorkFlowType_User,
-		Name:             req.Name,
-		Desc:             req.Desc,
-		IconURI:          req.IconURI,
-		AppID:            parseInt64(req.ProjectID),
-		Mode:             ternary.IFElse(req.IsSetFlowMode(), req.GetFlowMode(), workflow.WorkflowMode_Workflow),
+		CreatorID:   uID,                        // 工作流创建者ID，用于记录所有权和审计
+		SpaceID:     spaceID,                    // 所属工作空间ID，用于工作流的组织管理和权限控制
+		ContentType: workflow.WorkFlowType_User, // 标记为用户创建的工作流，区别于系统模板或示例工作流
+		Name:        req.Name,                   // 工作流显示名称，用户在界面上看到的标题
+		Desc:        req.Desc,                   // 工作流详细描述，说明工作流的用途和功能
+		IconURI:     req.IconURI,                // 工作流图标的URI地址，用于界面展示
+		AppID:       parseInt64(req.ProjectID),  // 关联的应用或项目ID，可选字段，用于项目级别的组织
+		// 工作流运行模式：如果请求中明确指定了模式则使用指定值，否则默认为标准工作流模式
+		// 支持不同的执行策略和行为模式
+		Mode: ternary.IFElse(req.IsSetFlowMode(), req.GetFlowMode(), workflow.WorkflowMode_Workflow),
+		// 初始画布配置：根据用户的语言偏好生成默认的可视化编辑界面配置
+		// 这为新工作流提供了开箱即用的编辑环境
 		InitCanvasSchema: entity.GetDefaultInitCanvasJsonSchema(i18n.GetLocale(ctx)),
 	}
 
+	// 5. 执行工作流创建的核心逻辑
+	// 调用领域层服务进行实际的创建操作，包括数据验证、持久化、索引建立等
 	id, err := GetWorkflowDomainSVC().Create(ctx, wf)
 	if err != nil {
+		// 如果创建失败，直接返回错误
+		// 错误会被上面的defer逻辑统一包装为标准格式
 		return nil, err
 	}
 
+	// 6. 构建并返回成功响应
+	// 将创建成功的工作流信息返回给客户端
 	return &workflow.CreateWorkflowResponse{
 		Data: &workflow.CreateWorkflowData{
+			// 将数字ID转换为字符串格式，符合API接口规范
+			// 同时避免大数字在JSON传输中的精度问题
 			WorkflowID: strconv.FormatInt(id, 10),
 		},
 	}, nil
 }
 
+// SaveWorkflow 保存工作流画布配置
+// 将用户在前端编辑的工作流画布配置保存到数据库
+// 支持保存工作流的节点、连线、参数等完整的画布结构
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息
+//   - req: 保存工作流请求，包含工作流ID、画布Schema、空间ID等
+//
+// 返回值:
+//   - SaveWorkflowResponse: 保存操作的响应结果
+//   - error: 保存过程中的错误信息
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限
+//  2. 调用领域服务保存工作流画布配置
+//  3. 返回保存结果
 func (w *ApplicationService) SaveWorkflow(ctx context.Context, req *workflow.SaveWorkflowRequest) (
 	_ *workflow.SaveWorkflowResponse, err error,
 ) {
+	// 统一的错误处理和恢复机制
 	defer func() {
+		// 捕获panic异常，确保服务稳定性
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
 		}
 
+		// 包装所有错误为标准的工作流操作失败错误
 		if err != nil {
 			err = vo.WrapIfNeeded(errno.ErrWorkflowOperationFail, err, errorx.KV("cause", vo.UnwrapRootErr(err).Error()))
 		}
 	}()
 
+	// 验证用户是否有权限访问指定的工作空间
+	// 从上下文获取用户ID，并检查对空间的访问权限
 	if err := checkUserSpace(ctx, ctxutil.MustGetUIDFromCtx(ctx), mustParseInt64(req.GetSpaceID())); err != nil {
 		return nil, err
 	}
 
+	// 调用领域服务执行实际的保存操作
+	// 将工作流ID和画布Schema传递给领域层进行持久化
 	if err := GetWorkflowDomainSVC().Save(ctx, mustParseInt64(req.WorkflowID), req.GetSchema()); err != nil {
 		return nil, err
 	}
 
+	// 返回保存成功的响应
+	// 这里返回空的数据结构，表示操作成功完成
 	return &workflow.SaveWorkflowResponse{
 		Data: &workflow.SaveWorkflowData{},
 	}, nil
 }
 
+// UpdateWorkflowMeta 更新工作流元数据信息
+// 更新工作流的基本信息，如名称、描述、图标等，不涉及画布内容的修改
+// 主要用于工作流设置页面的信息编辑功能
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息
+//   - req: 更新工作流元数据请求，包含工作流ID、名称、描述、图标URI等
+//
+// 返回值:
+//   - UpdateWorkflowMetaResponse: 更新操作的响应结果
+//   - error: 更新过程中的错误信息
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限
+//  2. 调用领域服务更新工作流元数据
+//  3. 返回更新结果
 func (w *ApplicationService) UpdateWorkflowMeta(ctx context.Context, req *workflow.UpdateWorkflowMetaRequest) (
 	_ *workflow.UpdateWorkflowMetaResponse, err error,
 ) {
@@ -247,6 +344,22 @@ func (w *ApplicationService) UpdateWorkflowMeta(ctx context.Context, req *workfl
 	return &workflow.UpdateWorkflowMetaResponse{}, nil
 }
 
+// DeleteWorkflow 删除指定的工作流
+// 软删除工作流，包括其元数据、画布配置和相关的执行历史
+// 删除后的工作流无法恢复，需要谨慎操作
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息
+//   - req: 删除工作流请求，包含工作流ID和空间ID
+//
+// 返回值:
+//   - DeleteWorkflowResponse: 删除操作的响应结果
+//   - error: 删除过程中的错误信息
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限
+//  2. 调用领域服务执行工作流删除操作
+//  3. 返回删除结果
 func (w *ApplicationService) DeleteWorkflow(ctx context.Context, req *workflow.DeleteWorkflowRequest) (
 	_ *workflow.DeleteWorkflowResponse, err error,
 ) {
@@ -280,6 +393,23 @@ func (w *ApplicationService) DeleteWorkflow(ctx context.Context, req *workflow.D
 	}, nil
 }
 
+// BatchDeleteWorkflow 批量删除多个工作流
+// 一次性删除多个工作流，提高删除效率，减少网络请求次数
+// 支持不同的删除动作，如移到回收站或永久删除
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息
+//   - req: 批量删除请求，包含工作流ID列表、空间ID和删除动作
+//
+// 返回值:
+//   - BatchDeleteWorkflowResponse: 批量删除操作的响应结果
+//   - error: 删除过程中的错误信息
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限
+//  2. 构建批量删除策略
+//  3. 调用领域服务执行批量删除
+//  4. 返回删除结果统计
 func (w *ApplicationService) BatchDeleteWorkflow(ctx context.Context, req *workflow.BatchDeleteWorkflowRequest) (
 	_ *workflow.BatchDeleteWorkflowResponse, err error,
 ) {
@@ -318,9 +448,40 @@ func (w *ApplicationService) BatchDeleteWorkflow(ctx context.Context, req *workf
 	}, nil
 }
 
+// GetCanvasInfo 获取工作流画布信息
+// 这是工作流应用服务的核心查询方法，负责获取完整的工作流画布配置数据
+//
+// 功能描述:
+// 返回工作流的完整画布配置，包括节点、连线、变量等详细信息，用于前端加载和展示
+// 工作流的可视化编辑界面。该方法会根据工作流的状态返回相应的版本控制信息和开发状态。
+//
+// 权限要求:
+// - 用户必须对指定的工作空间具有访问权限（模板空间除外）
+// - 自动验证用户身份和权限范围
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息、链路追踪等上下文数据
+//   - req: 获取画布信息请求对象，必须包含有效的工作流ID和空间ID
+//
+// 返回值:
+//   - GetCanvasInfoResponse: 包含完整画布配置的响应对象，包含工作流基本信息、VCS数据、版本信息
+//   - error: 获取过程中的错误信息，包括权限验证失败、数据不存在、系统异常等
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限（跳过模板空间的权限检查）
+//  2. 从领域服务层获取工作流的详细信息（从草稿版本获取）
+//  3. 根据工作流状态确定开发状态和VCS类型
+//  4. 计算最新的更新时间（比较多个时间源）
+//  5. 构建完整的画布数据结构并返回给前端
+//
+// 异常处理:
+//   - 使用defer机制捕获panic异常，转换为标准错误
+//   - 统一包装业务异常，提供详细的错误上下文信息
 func (w *ApplicationService) GetCanvasInfo(ctx context.Context, req *workflow.GetCanvasInfoRequest) (
 	_ *workflow.GetCanvasInfoResponse, err error,
 ) {
+	// 统一的异常处理和错误包装机制
+	// 确保任何panic都被捕获并转换为标准错误，同时包装业务错误信息
 	defer func() {
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
@@ -331,12 +492,16 @@ func (w *ApplicationService) GetCanvasInfo(ctx context.Context, req *workflow.Ge
 		}
 	}()
 
+	// 步骤1: 验证用户对工作空间的访问权限
+	// 注意：模板空间（TemplateSpaceID）跳过权限验证，允许所有用户访问
 	if req.GetSpaceID() != strconv.FormatInt(consts.TemplateSpaceID, 10) {
 		if err := checkUserSpace(ctx, ctxutil.MustGetUIDFromCtx(ctx), mustParseInt64(req.GetSpaceID())); err != nil {
 			return nil, err
 		}
 	}
 
+	// 步骤2: 调用领域服务获取工作流详细信息
+	// 使用FromDraft策略获取草稿版本的工作流数据
 	wf, err := GetWorkflowDomainSVC().Get(ctx, &vo.GetPolicy{
 		ID:    mustParseInt64(req.GetWorkflowID()),
 		QType: vo.FromDraft,
@@ -345,11 +510,15 @@ func (w *ApplicationService) GetCanvasInfo(ctx context.Context, req *workflow.Ge
 		return nil, err
 	}
 
+	// 步骤3: 根据工作流测试运行状态确定开发状态
+	// 默认状态为不可提交，只有测试运行成功后才允许提交
 	devStatus := workflow.WorkFlowDevStatus_CanNotSubmit
 	if wf.TestRunSuccess {
 		devStatus = workflow.WorkFlowDevStatus_CanSubmit
 	}
 
+	// 步骤4: 确定版本控制系统(VCS)的画布类型
+	// 默认为草稿类型，如果工作流未被修改则为发布类型
 	vcsType := workflow.VCSCanvasType_Draft
 
 	if !wf.Modified {
@@ -357,23 +526,32 @@ func (w *ApplicationService) GetCanvasInfo(ctx context.Context, req *workflow.Ge
 		devStatus = workflow.WorkFlowDevStatus_HadSubmit
 	}
 
+	// 步骤5: 计算工作流的最新更新时间
+	// 比较多个时间源（基础更新时间、草稿元数据时间、版本元数据时间）取最新值
 	updateTime := time.Time{}
 	if wf.UpdatedAt != nil {
 		updateTime = *wf.UpdatedAt
 	}
+	// 检查草稿元数据的时间戳
 	if wf.DraftMeta != nil && wf.DraftMeta.Timestamp.After(updateTime) {
 		updateTime = wf.DraftMeta.Timestamp
 	}
+	// 检查版本元数据的创建时间
 	if wf.VersionMeta != nil && wf.VersionMeta.VersionCreatedAt.After(updateTime) {
 		updateTime = wf.VersionMeta.VersionCreatedAt
 	}
 
+	// 步骤6: 确定插件ID
+	// 只有已发布的工作流才有有效的插件ID，否则使用默认值"0"
 	pluginID := "0"
 	if wf.HasPublished {
 		pluginID = strconv.FormatInt(wf.ID, 10)
 	}
 
+	// 步骤7: 构建完整的画布数据结构
+	// 包含工作流基本信息、VCS数据、版本信息等前端所需的所有数据
 	canvasData := &workflow.CanvasData{
+		// 工作流基本信息
 		Workflow: &workflow.Workflow{
 			WorkflowID:       strconv.FormatInt(wf.ID, 10),
 			Name:             wf.Name,
@@ -387,30 +565,70 @@ func (w *ApplicationService) GetCanvasInfo(ctx context.Context, req *workflow.Ge
 			Tag:              wf.Tag,
 			TemplateAuthorID: ternary.IFElse(wf.AuthorID > 0, ptr.Of(strconv.FormatInt(wf.AuthorID, 10)), nil),
 			SpaceID:          ptr.Of(strconv.FormatInt(wf.SpaceID, 10)),
-			SchemaJSON:       ptr.Of(wf.Canvas),
+			SchemaJSON:       ptr.Of(wf.Canvas), // 工作流的画布JSON配置
 			Creator: &workflow.Creator{
 				ID:   strconv.FormatInt(wf.CreatorID, 10),
 				Self: ternary.IFElse[bool](wf.CreatorID == ptr.From(ctxutil.GetUIDFromCtx(ctx)), true, false),
 			},
 			FlowMode:         wf.Mode,
 			ProjectID:        i64PtrToStringPtr(wf.AppID),
-			PersistenceModel: workflow.PersistenceModel_VCS, // the front-end validation logic, this field returns VCS, developers don't need to pay attention
+			PersistenceModel: workflow.PersistenceModel_VCS, // 前端验证逻辑需要，固定返回VCS模式
 			PluginID:         pluginID,
 		},
+		// 版本控制系统数据
 		VcsData: &workflow.VCSCanvasData{
 			SubmitCommitID: wf.CommitID,
 			DraftCommitID:  wf.CommitID,
 			Type:           vcsType,
 		},
+		// 工作流版本信息
 		WorkflowVersion: wf.LatestPublishedVersion,
 	}
 
+	// 步骤8: 返回构建完成的画布配置响应
 	return &workflow.GetCanvasInfoResponse{
 		Data: canvasData,
 	}, nil
 }
 
+// TestRun 执行工作流测试运行
+// 这是工作流应用服务的核心测试执行方法，提供安全的工作流调试环境
+//
+// 功能描述:
+// 在开发环境中异步执行工作流测试，不会影响生产数据和正式环境。该方法主要用于
+// 工作流的功能验证、参数调试和性能测试，支持前台任务执行和实时调试反馈。
+//
+// 执行特性:
+// - 异步执行模式，避免长时间阻塞用户请求
+// - 支持取消操作，提供良好的用户体验
+// - 隔离的调试环境，确保测试安全性
+// - 完整的执行日志和错误追踪
+//
+// 参数限制:
+// - 项目ID(ProjectID)和机器人ID(BotID)不能同时设置
+// - 必须具有指定工作空间的访问权限
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息、链路追踪、超时控制等上下文数据
+//   - req: 工作流测试运行请求对象，包含工作流ID、输入参数、空间ID、项目/机器人关联等
+//
+// 返回值:
+//   - WorkFlowTestRunResponse: 测试运行的响应对象，包含执行ID用于后续状态查询
+//   - error: 测试运行过程中的错误信息，包括权限验证、参数校验、执行启动失败等
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限
+//  2. 解析和验证请求参数（项目ID、机器人ID的互斥性检查）
+//  3. 构建执行配置对象，设置调试模式和异步执行参数
+//  4. 调用领域服务异步启动工作流执行
+//  5. 返回执行ID供前端查询执行状态和结果
+//
+// 异常处理:
+//   - 统一捕获panic异常并转换为标准错误
+//   - 包装执行相关的业务异常，提供详细错误上下文
 func (w *ApplicationService) TestRun(ctx context.Context, req *workflow.WorkFlowTestRunRequest) (_ *workflow.WorkFlowTestRunResponse, err error) {
+	// 统一的异常处理和错误包装机制
+	// 确保测试执行过程中的任何异常都被妥善处理
 	defer func() {
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
@@ -421,12 +639,15 @@ func (w *ApplicationService) TestRun(ctx context.Context, req *workflow.WorkFlow
 		}
 	}()
 
+	// 步骤1: 获取当前用户ID并验证工作空间访问权限
 	uID := ctxutil.MustGetUIDFromCtx(ctx)
 
 	if err := checkUserSpace(ctx, uID, mustParseInt64(req.GetSpaceID())); err != nil {
 		return nil, err
 	}
 
+	// 步骤2: 解析和验证可选的关联参数
+	// 支持工作流与项目或机器人的关联，但两者不能同时设置
 	var appID, agentID *int64
 	if req.IsSetProjectID() {
 		appID = ptr.Of(mustParseInt64(req.GetProjectID()))
@@ -435,31 +656,39 @@ func (w *ApplicationService) TestRun(ctx context.Context, req *workflow.WorkFlow
 		agentID = ptr.Of(mustParseInt64(req.GetBotID()))
 	}
 
+	// 步骤3: 构建工作流执行配置对象
+	// 配置调试模式的执行环境，支持异步执行和取消操作
 	exeCfg := vo.ExecuteConfig{
-		ID:           mustParseInt64(req.GetWorkflowID()),
-		From:         vo.FromDraft,
-		CommitID:     req.GetCommitID(),
-		Operator:     uID,
-		Mode:         vo.ExecuteModeDebug,
-		AppID:        appID,
-		AgentID:      agentID,
-		ConnectorID:  consts.CozeConnectorID,
-		ConnectorUID: strconv.FormatInt(uID, 10),
-		TaskType:     vo.TaskTypeForeground,
-		SyncPattern:  vo.SyncPatternAsync,
-		BizType:      vo.BizTypeWorkflow,
-		Cancellable:  true,
+		ID:           mustParseInt64(req.GetWorkflowID()), // 工作流ID
+		From:         vo.FromDraft,                        // 从草稿版本执行
+		CommitID:     req.GetCommitID(),                   // 指定的提交ID（可选）
+		Operator:     uID,                                 // 执行操作者
+		Mode:         vo.ExecuteModeDebug,                 // 调试执行模式
+		AppID:        appID,                               // 关联的项目ID（可选）
+		AgentID:      agentID,                             // 关联的机器人ID（可选）
+		ConnectorID:  consts.CozeConnectorID,              // 连接器ID
+		ConnectorUID: strconv.FormatInt(uID, 10),          // 连接器用户ID
+		TaskType:     vo.TaskTypeForeground,               // 前台任务类型
+		SyncPattern:  vo.SyncPatternAsync,                 // 异步执行模式
+		BizType:      vo.BizTypeWorkflow,                  // 业务类型：工作流
+		Cancellable:  true,                                // 支持取消操作
 	}
 
+	// 步骤4: 验证参数互斥性
+	// 项目ID和机器人ID不能同时设置，避免执行上下文冲突
 	if exeCfg.AppID != nil && exeCfg.AgentID != nil {
 		return nil, errors.New("project_id and bot_id cannot be set at the same time")
 	}
 
+	// 步骤5: 调用领域服务异步执行工作流
+	// 将请求输入参数转换为通用值类型，启动异步执行
 	exeID, err := GetWorkflowDomainSVC().AsyncExecute(ctx, exeCfg, maps.ToAnyValue(req.Input))
 	if err != nil {
 		return nil, err
 	}
 
+	// 步骤6: 构建并返回测试运行响应
+	// 返回执行ID供前端查询执行状态和获取结果
 	return &workflow.WorkFlowTestRunResponse{
 		Data: &workflow.WorkFlowTestRunData{
 			WorkflowID: req.WorkflowID,
@@ -468,9 +697,54 @@ func (w *ApplicationService) TestRun(ctx context.Context, req *workflow.WorkFlow
 	}, nil
 }
 
+// NodeDebug 执行工作流单节点调试
+// 这是工作流应用服务的精细化调试方法，支持对工作流中的单个节点进行独立测试
+//
+// 功能描述:
+// 允许开发者单独测试工作流中某个特定节点的执行效果，无需运行整个工作流。这种
+// 精细化调试能力极大提高了复杂工作流的开发效率，特别适用于定位和解决问题节点。
+//
+// 调试特性:
+// - 支持多种输入参数类型的合并处理（input、batch、setting）
+// - 独立的节点执行环境，不影响其他节点状态
+// - 异步执行模式，支持长时间运行的节点调试
+// - 完整的节点执行日志和错误追踪
+//
+// 参数合并策略:
+// - input: 节点的直接输入参数
+// - batch: 批处理相关的参数
+// - setting: 节点配置参数
+// - 所有参数在执行时被合并为统一的输入映射
+//
+// 参数限制:
+// - 项目ID(ProjectID)和机器人ID(BotID)不能同时设置
+// - 必须具有指定工作空间的访问权限
+// - 节点ID必须是工作流中的有效节点
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息、链路追踪、超时控制等上下文数据
+//   - req: 节点调试请求对象，包含工作流ID、节点ID、多种类型的输入参数等
+//
+// 返回值:
+//   - WorkflowNodeDebugV2Response: 节点调试的响应对象，包含执行ID用于查询调试结果
+//   - error: 调试过程中的错误信息，包括权限验证、参数校验、节点执行启动失败等
+//
+// 业务流程:
+//  1. 验证用户对工作空间的访问权限
+//  2. 合并多种类型的输入参数（input、batch、setting）
+//  3. 解析和验证关联参数（项目ID、机器人ID的互斥性检查）
+//  4. 构建节点调试专用的执行配置
+//  5. 调用领域服务异步执行单节点调试
+//  6. 返回执行ID供前端查询调试状态和结果
+//
+// 异常处理:
+//   - 统一捕获panic异常并转换为标准错误
+//   - 包装节点执行相关的业务异常，提供详细错误上下文
 func (w *ApplicationService) NodeDebug(ctx context.Context, req *workflow.WorkflowNodeDebugV2Request) (
 	_ *workflow.WorkflowNodeDebugV2Response, err error,
 ) {
+	// 统一的异常处理和错误包装机制
+	// 确保节点调试过程中的任何异常都被妥善处理
 	defer func() {
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
@@ -481,24 +755,32 @@ func (w *ApplicationService) NodeDebug(ctx context.Context, req *workflow.Workfl
 		}
 	}()
 
+	// 步骤1: 获取当前用户ID并验证工作空间访问权限
 	uID := ctxutil.MustGetUIDFromCtx(ctx)
 
 	if err := checkUserSpace(ctx, uID, mustParseInt64(req.GetSpaceID())); err != nil {
 		return nil, err
 	}
 
-	// merge input, batch and setting, they are all the same when executing
+	// 步骤2: 合并多种类型的输入参数
+	// 将input、batch、setting三种参数类型合并为统一的输入映射
+	// 这些参数在节点执行时具有相同的作用，需要统一处理
 	mergedInput := make(map[string]string, len(req.Input)+len(req.Batch)+len(req.Setting))
+	// 合并直接输入参数
 	for k, v := range req.Input {
 		mergedInput[k] = v
 	}
+	// 合并批处理参数
 	for k, v := range req.Batch {
 		mergedInput[k] = v
 	}
+	// 合并配置参数
 	for k, v := range req.Setting {
 		mergedInput[k] = v
 	}
 
+	// 步骤3: 解析和验证可选的关联参数
+	// 支持节点调试与项目或机器人的关联，但两者不能同时设置
 	var appID, agentID *int64
 	if req.IsSetProjectID() {
 		appID = ptr.Of(mustParseInt64(req.GetProjectID()))
@@ -507,30 +789,38 @@ func (w *ApplicationService) NodeDebug(ctx context.Context, req *workflow.Workfl
 		agentID = ptr.Of(mustParseInt64(req.GetBotID()))
 	}
 
+	// 步骤4: 构建节点调试专用的执行配置对象
+	// 配置节点调试模式的执行环境，支持异步执行和取消操作
 	exeCfg := vo.ExecuteConfig{
-		ID:           mustParseInt64(req.GetWorkflowID()),
-		From:         vo.FromDraft,
-		Operator:     uID,
-		Mode:         vo.ExecuteModeNodeDebug,
-		AppID:        appID,
-		AgentID:      agentID,
-		ConnectorID:  consts.CozeConnectorID,
-		ConnectorUID: strconv.FormatInt(uID, 10),
-		TaskType:     vo.TaskTypeForeground,
-		SyncPattern:  vo.SyncPatternAsync,
-		BizType:      vo.BizTypeWorkflow,
-		Cancellable:  true,
+		ID:           mustParseInt64(req.GetWorkflowID()), // 工作流ID
+		From:         vo.FromDraft,                        // 从草稿版本执行
+		Operator:     uID,                                 // 执行操作者
+		Mode:         vo.ExecuteModeNodeDebug,             // 节点调试执行模式
+		AppID:        appID,                               // 关联的项目ID（可选）
+		AgentID:      agentID,                             // 关联的机器人ID（可选）
+		ConnectorID:  consts.CozeConnectorID,              // 连接器ID
+		ConnectorUID: strconv.FormatInt(uID, 10),          // 连接器用户ID
+		TaskType:     vo.TaskTypeForeground,               // 前台任务类型
+		SyncPattern:  vo.SyncPatternAsync,                 // 异步执行模式
+		BizType:      vo.BizTypeWorkflow,                  // 业务类型：工作流
+		Cancellable:  true,                                // 支持取消操作
 	}
 
+	// 步骤5: 验证参数互斥性
+	// 项目ID和机器人ID不能同时设置，避免执行上下文冲突
 	if exeCfg.AppID != nil && exeCfg.AgentID != nil {
 		return nil, errors.New("project_id and bot_id cannot be set at the same time")
 	}
 
+	// 步骤6: 调用领域服务异步执行单节点调试
+	// 指定节点ID和合并后的输入参数，启动异步节点执行
 	exeID, err := GetWorkflowDomainSVC().AsyncExecuteNode(ctx, req.NodeID, exeCfg, maps.ToAnyValue(mergedInput))
 	if err != nil {
 		return nil, err
 	}
 
+	// 步骤7: 构建并返回节点调试响应
+	// 返回工作流ID、节点ID和执行ID供前端查询调试状态和获取结果
 	return &workflow.WorkflowNodeDebugV2Response{
 		Data: &workflow.WorkflowNodeDebugV2Data{
 			WorkflowID: req.WorkflowID,
@@ -1126,6 +1416,16 @@ func (w *ApplicationService) MoveWorkflowFromAppToLibrary(ctx context.Context, w
 	return copiedWf.ID, nil, nil
 }
 
+// convertNodeExecution 将节点执行实体转换为API响应格式
+// 用于将内部的节点执行结果转换为前端可展示的格式
+// 包含节点的状态、输入输出、执行时间、错误信息等完整信息
+//
+// 参数:
+//   - nodeExe: 节点执行实体，包含执行的详细信息
+//
+// 返回值:
+//   - NodeResult: API响应格式的节点执行结果
+//   - error: 转换过程中的错误信息
 func convertNodeExecution(nodeExe *entity.NodeExecution) (*workflow.NodeResult, error) {
 	nType, err := entityNodeTypeToAPINodeTemplateType(nodeExe.NodeType)
 	if err != nil {
@@ -1353,6 +1653,28 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 	}
 }
 
+// OpenAPIStreamRun 通过OpenAPI流式执行工作流
+// 提供Server-Sent Events (SSE) 流式响应，实时返回工作流执行进度
+// 主要用于第三方系统集成和需要实时反馈的场景
+//
+// 参数:
+//   - ctx: 请求上下文，包含API密钥认证信息
+//   - req: OpenAPI工作流运行请求，包含工作流ID、输入参数等
+//
+// 返回值:
+//   - StreamReader: SSE流式响应读取器，实时推送执行进度
+//   - error: 执行过程中的错误信息
+//
+// 业务流程:
+//  1. 验证API密钥和用户权限
+//  2. 构建流式执行配置
+//  3. 启动工作流异步执行
+//  4. 返回SSE流式响应读取器
+//
+// 特点:
+//   - 支持实时进度推送
+//   - 适用于长时间运行的工作流
+//   - 提供节点级别的执行状态反馈
 func (w *ApplicationService) OpenAPIStreamRun(ctx context.Context, req *workflow.OpenAPIRunFlowRequest) (
 	_ *schema.StreamReader[*workflow.OpenAPIStreamRunFlowResponse], err error,
 ) {
@@ -1931,6 +2253,29 @@ func (w *ApplicationService) QueryWorkflowNodeTypes(ctx context.Context, req *wo
 	return response, nil
 }
 
+// PublishWorkflow 发布工作流到生产环境
+// 将工作流的当前版本发布为正式版本，供外部API调用和生产使用
+// 发布后的工作流会获得固定的版本号，保证API调用的稳定性
+//
+// 参数:
+//   - ctx: 请求上下文，包含用户会话信息
+//   - req: 发布工作流请求，包含工作流ID、版本描述、是否强制发布等
+//
+// 返回值:
+//   - PublishWorkflowResponse: 发布操作的响应，包含发布状态和版本信息
+//   - error: 发布过程中的错误信息
+//
+// 业务流程:
+//  1. 验证用户权限和工作流状态
+//  2. 检查工作流的有效性和完整性
+//  3. 创建新的发布版本
+//  4. 更新搜索索引和缓存
+//  5. 返回发布结果
+//
+// 注意事项:
+//   - 发布前会进行完整性验证
+//   - 支持强制发布选项
+//   - 发布后版本不可修改
 func (w *ApplicationService) PublishWorkflow(ctx context.Context, req *workflow.PublishWorkflowRequest) (
 	_ *workflow.PublishWorkflowResponse, err error,
 ) {
@@ -3286,6 +3631,10 @@ func (w *ApplicationService) CopyWkTemplateApi(ctx context.Context, req *workflo
 	return resp, err
 }
 
+// mustParseInt64 强制将字符串转换为int64类型
+// 如果转换失败会触发panic，通常用于已确定有效的字符串ID转换
+// 参数: s - 需要转换的字符串
+// 返回值: 转换后的int64数值
 func mustParseInt64(s string) int64 {
 	i, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
@@ -3294,6 +3643,10 @@ func mustParseInt64(s string) int64 {
 	return i
 }
 
+// parseInt64 安全地将字符串指针转换为int64指针
+// 如果输入为nil则返回nil，否则调用mustParseInt64进行转换
+// 参数: s - 字符串指针，可能为nil
+// 返回值: 转换后的int64指针，可能为nil
 func parseInt64(s *string) *int64 {
 	if s == nil {
 		return nil
@@ -3303,6 +3656,16 @@ func parseInt64(s *string) *int64 {
 	return &i
 }
 
+// toWorkflowParameter 将领域模型的类型信息转换为API响应的参数格式
+// 用于将内部的数据类型定义转换为前端和API调用方可识别的参数描述
+// 支持多种数据类型的转换，包括字符串、数字、布尔值、数组和对象等
+//
+// 参数:
+//   - nType: 领域模型中的命名类型信息，包含类型、名称、描述等
+//
+// 返回值:
+//   - Parameter: API响应格式的参数定义
+//   - error: 转换过程中的错误信息（如不支持的类型）
 func toWorkflowParameter(nType *vo.NamedTypeInfo) (*workflow.Parameter, error) {
 	wp := &workflow.Parameter{Name: nType.Name}
 	wp.Desc = nType.Desc
@@ -3799,12 +4162,25 @@ func (g *GetLLMNodeFCSettingDetailResponse) MarshalJSON() ([]byte, error) {
 	return sonic.Marshal(result)
 }
 
+// checkUserSpace 检查用户是否有权限访问指定的工作空间
+// 验证用户是否属于指定的工作空间，确保用户只能操作自己有权限的资源
+// 这是一个重要的权限控制函数，在所有工作流操作前都会调用
+//
+// 参数:
+//   - ctx: 请求上下文
+//   - uid: 用户ID
+//   - spaceID: 工作空间ID
+//
+// 返回值:
+//   - error: 如果用户无权限访问则返回错误，否则返回nil
 func checkUserSpace(ctx context.Context, uid int64, spaceID int64) error {
+	// 获取用户有权限的所有工作空间列表
 	spaces, err := crossuser.DefaultSVC().GetUserSpaceList(ctx, uid)
 	if err != nil {
 		return err
 	}
 
+	// 检查目标工作空间是否在用户的权限列表中
 	var match bool
 	for _, s := range spaces {
 		if s.ID == spaceID {
@@ -3813,9 +4189,11 @@ func checkUserSpace(ctx context.Context, uid int64, spaceID int64) error {
 		}
 	}
 
+	// 如果用户无权限访问该工作空间，返回错误
 	if !match {
 		return fmt.Errorf("user %d does not have access to space %d", uid, spaceID)
 	}
 
+	// 权限验证通过
 	return nil
 }

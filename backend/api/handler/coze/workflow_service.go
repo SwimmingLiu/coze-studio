@@ -37,23 +37,35 @@ import (
 	"github.com/coze-dev/coze-studio/backend/pkg/sonic"
 )
 
-// CreateWorkflow .
+// CreateWorkflow 创建工作流API处理函数
+// 该函数负责处理创建工作流的HTTP POST请求，包括参数验证、业务逻辑调用和响应返回
 // @router /api/workflow_api/create [POST]
 func CreateWorkflow(ctx context.Context, c *app.RequestContext) {
 	var err error
+	// 定义请求参数结构体，用于接收客户端传来的工作流创建请求数据
 	var req workflow.CreateWorkflowRequest
+
+	// 将HTTP请求体中的JSON数据绑定到请求结构体，并进行参数验证
+	// 如果请求格式不正确或必填字段缺失，会返回验证错误
 	err = c.BindAndValidate(&req)
 	if err != nil {
+		// 参数绑定或验证失败，返回400 Bad Request错误响应给客户端
 		invalidParamRequestResponse(c, err.Error())
 		return
 	}
 
+	// 调用应用层服务执行工作流创建的核心业务逻辑
+	// 传入上下文和验证后的请求参数
 	resp, err := appworkflow.SVC.CreateWorkflow(ctx, &req)
 	if err != nil {
+		// 业务逻辑处理失败（如数据库操作失败、业务规则校验失败等）
+		// 返回500 Internal Server Error错误响应
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 工作流创建成功，返回200 OK状态码和创建结果的JSON响应
+	// resp包含新创建的工作流信息
 	c.JSON(consts.StatusOK, resp)
 }
 

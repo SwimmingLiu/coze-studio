@@ -100,41 +100,73 @@ func (i *impl) ListNodeMeta(ctx context.Context, nodeTypes map[entity.NodeType]b
 	return nodeMetaMap, entity.Categories, nil
 }
 
+// Create 工作流创建的领域层核心实现
+// 该函数负责执行工作流创建的完整业务逻辑，包括元数据持久化、初始画布创建和搜索索引更新
+//
+// 参数说明:
+//   - ctx: 请求上下文，用于传递用户信息、控制请求生命周期
+//   - meta: 工作流创建元数据，包含工作流的基本信息和初始配置
+//
+// 返回值:
+//   - int64: 新创建的工作流ID，用于后续操作的标识
+//   - error: 创建过程中的错误信息
+//
+// 业务流程:
+//  1. 创建工作流元数据记录（数据库持久化）
+//  2. 保存初始画布配置到草稿
+//  3. 发布工作流资源变更通知（用于搜索索引和其他系统）
 func (i *impl) Create(ctx context.Context, meta *vo.MetaCreate) (int64, error) {
+	// 第一步：创建工作流基础元数据
+	// 调用仓储层将工作流的基本信息持久化到数据库
+	// 这里将MetaCreate转换为Meta结构，去除了InitCanvasSchema字段
 	id, err := i.repo.CreateMeta(ctx, &vo.Meta{
-		CreatorID:   meta.CreatorID,
-		SpaceID:     meta.SpaceID,
-		ContentType: meta.ContentType,
-		Name:        meta.Name,
-		Desc:        meta.Desc,
-		IconURI:     meta.IconURI,
-		AppID:       meta.AppID,
-		Mode:        meta.Mode,
+		CreatorID:   meta.CreatorID,   // 工作流创建者的用户ID
+		SpaceID:     meta.SpaceID,     // 所属工作空间ID，用于权限控制和组织管理
+		ContentType: meta.ContentType, // 内容类型，区分用户工作流、系统模板等
+		Name:        meta.Name,        // 工作流显示名称
+		Desc:        meta.Desc,        // 工作流详细描述
+		IconURI:     meta.IconURI,     // 工作流图标URI，用于界面展示
+		AppID:       meta.AppID,       // 关联的应用ID，可选字段
+		Mode:        meta.Mode,        // 工作流运行模式，影响执行策略
 	})
 	if err != nil {
+		// 如果元数据创建失败，直接返回错误
+		// 此时还没有创建任何关联数据，无需回滚操作
 		return 0, err
 	}
 
-	// save the initialized  canvas information to the draft
+	// 第二步：保存初始画布配置
+	// 将预定义的画布JSON配置保存为工作流的初始草稿版本
+	// 这为用户提供了开箱即用的可视化编辑环境
 	if err = i.Save(ctx, id, meta.InitCanvasSchema); err != nil {
+		// 如果画布保存失败，返回错误
+		// 注意：此时元数据已经创建，但由于这是创建流程的一部分，
+		// 应该由更上层的事务机制来处理数据一致性
 		return 0, err
 	}
 
+	// 第三步：发布工作流资源创建事件
+	// 通知搜索引擎和其他订阅系统，有新的工作流资源被创建
+	// 这确保了工作流能够被正确索引和搜索
 	err = search.GetNotifier().PublishWorkflowResource(ctx, search.Created, &search.Resource{
-		WorkflowID:    id,
-		URI:           &meta.IconURI,
-		Name:          &meta.Name,
-		Desc:          &meta.Desc,
-		APPID:         meta.AppID,
-		SpaceID:       &meta.SpaceID,
-		OwnerID:       &meta.CreatorID,
-		Mode:          ptr.Of(int32(meta.Mode)),
-		PublishStatus: ptr.Of(search.UnPublished),
-		CreatedAt:     ptr.Of(time.Now().UnixMilli()),
+		WorkflowID:    id,                             // 新创建的工作流ID
+		URI:           &meta.IconURI,                  // 工作流图标URI
+		Name:          &meta.Name,                     // 工作流名称
+		Desc:          &meta.Desc,                     // 工作流描述
+		APPID:         meta.AppID,                     // 关联的应用ID
+		SpaceID:       &meta.SpaceID,                  // 所属空间ID
+		OwnerID:       &meta.CreatorID,                // 工作流所有者ID
+		Mode:          ptr.Of(int32(meta.Mode)),       // 工作流模式，转换为int32指针
+		PublishStatus: ptr.Of(search.UnPublished),     // 发布状态，新创建的工作流默认为未发布状态
+		CreatedAt:     ptr.Of(time.Now().UnixMilli()), // 创建时间戳，使用毫秒级Unix时间戳
 	})
 	if err != nil {
+		// 如果通知发布失败，包装错误并返回
+		// 这个错误不应该影响工作流的基本创建，但会影响搜索功能
 		return 0, vo.WrapError(errno.ErrNotifyWorkflowResourceChangeErr, err)
 	}
+
+	// 所有步骤成功完成，返回新创建的工作流ID
 	return id, nil
 }
 
