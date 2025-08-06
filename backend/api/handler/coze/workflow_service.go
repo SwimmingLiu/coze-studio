@@ -704,7 +704,7 @@ func GetWorkflowDetailInfo(ctx context.Context, c *app.RequestContext) {
 	c.JSON(consts.StatusOK, response)
 }
 
-// ValidateTree .
+// ValidateTree . TODO 验证工作流是否正常
 // @router /api/workflow_api/validate_tree [POST]
 func ValidateTree(ctx context.Context, c *app.RequestContext) {
 	var err error
@@ -843,16 +843,33 @@ func preprocessWorkflowRequestBody(_ context.Context, c *app.RequestContext) err
 	return nil
 }
 
-// OpenAPIRunFlow .
+// OpenAPIRunFlow 执行工作流运行接口
+// 该函数处理工作流的同步执行请求，类似于 Spring Boot 中 @PostMapping 注解的 Controller 方法
+//
+// 功能说明：
+//   - 接收工作流运行请求并进行参数验证
+//   - 调用应用层服务执行工作流
+//   - 处理执行结果并返回响应
+//   - 支持错误处理和调试信息返回
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，直接通过 c.JSON 返回 HTTP 响应
+//
 // @router /v1/workflow/run [POST]
 func OpenAPIRunFlow(ctx context.Context, c *app.RequestContext) {
 	var err error
 
+	// 步骤1: 预处理请求体，进行基础校验和格式化
 	if err = preprocessWorkflowRequestBody(ctx, c); err != nil {
 		invalidParamRequestResponse(c, err.Error())
 		return
 	}
 
+	// 步骤2: 绑定并验证请求参数到结构体
 	var req workflow.OpenAPIRunFlowRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -860,8 +877,10 @@ func OpenAPIRunFlow(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤3: 调用应用层服务执行工作流
 	resp, err := appworkflow.SVC.OpenAPIRun(ctx, &req)
 	if err != nil {
+		// 步骤4: 处理业务错误，将工作流特定错误转换为标准响应格式
 		var se vo.WorkflowError
 		if errors.As(err, &se) {
 			resp = new(workflow.OpenAPIRunFlowResponse)
@@ -875,35 +894,51 @@ func OpenAPIRunFlow(ctx context.Context, c *app.RequestContext) {
 			return
 		}
 
+		// 步骤5: 处理系统级错误
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 步骤6: 返回成功响应
 	c.JSON(consts.StatusOK, resp)
 }
 
+// streamRunData 流式运行数据结构
+// 用于封装工作流流式执行过程中的响应数据，类似于 Spring Boot 中的 DTO (Data Transfer Object)
 type streamRunData struct {
-	Content       *string        `json:"content,omitempty"`
-	ContentType   *string        `json:"content_type,omitempty"`
-	NodeSeqID     *string        `json:"node_seq_id,omitempty"`
-	NodeID        *string        `json:"node_id,omitempty"`
-	NodeIsFinish  *bool          `json:"node_is_finish,omitempty"`
-	NodeType      *string        `json:"node_type,omitempty"`
-	NodeTitle     *string        `json:"node_title,omitempty"`
-	Token         *int64         `json:"token,omitempty"`
-	DebugURL      *string        `json:"debug_url,omitempty"`
-	ErrorCode     *int64         `json:"error_code,omitempty"`
-	ErrorMessage  *string        `json:"error_message,omitempty"`
-	InterruptData *interruptData `json:"interrupt_data,omitempty"`
+	Content       *string        `json:"content,omitempty"`        // 节点输出内容
+	ContentType   *string        `json:"content_type,omitempty"`   // 内容类型
+	NodeSeqID     *string        `json:"node_seq_id,omitempty"`    // 节点序列ID
+	NodeID        *string        `json:"node_id,omitempty"`        // 节点唯一标识
+	NodeIsFinish  *bool          `json:"node_is_finish,omitempty"` // 节点是否执行完成
+	NodeType      *string        `json:"node_type,omitempty"`      // 节点类型
+	NodeTitle     *string        `json:"node_title,omitempty"`     // 节点标题
+	Token         *int64         `json:"token,omitempty"`          // 消耗的 token 数量
+	DebugURL      *string        `json:"debug_url,omitempty"`      // 调试链接
+	ErrorCode     *int64         `json:"error_code,omitempty"`     // 错误代码
+	ErrorMessage  *string        `json:"error_message,omitempty"`  // 错误消息
+	InterruptData *interruptData `json:"interrupt_data,omitempty"` // 中断数据
 }
 
+// interruptData 中断数据结构
+// 用于处理工作流执行过程中的中断事件信息
 type interruptData struct {
-	EventID string `json:"event_id"`
-	Type    int64  `json:"type"`
-	Data    string `json:"data"`
+	EventID string `json:"event_id"` // 事件唯一标识
+	Type    int64  `json:"type"`     // 中断类型
+	Data    string `json:"data"`     // 中断相关数据
 }
 
+// convertStreamRunData 转换流式运行数据
+// 将应用层的流式响应数据转换为 API 层的响应格式
+// 类似于 Spring Boot 中的 Converter 或 Mapper，用于不同层之间的数据转换
+//
+// 参数：
+//   - msg: 应用层的流式运行响应数据
+//
+// 返回：
+//   - *streamRunData: 转换后的 API 响应数据结构
 func convertStreamRunData(msg *workflow.OpenAPIStreamRunFlowResponse) *streamRunData {
+	// 处理中断数据的转换
 	var ie *interruptData
 	if msg.InterruptData != nil {
 		ie = &interruptData{
@@ -913,6 +948,7 @@ func convertStreamRunData(msg *workflow.OpenAPIStreamRunFlowResponse) *streamRun
 		}
 	}
 
+	// 构建并返回转换后的数据结构
 	return &streamRunData{
 		Content:       msg.Content,
 		ContentType:   msg.ContentType,
@@ -929,20 +965,37 @@ func convertStreamRunData(msg *workflow.OpenAPIStreamRunFlowResponse) *streamRun
 	}
 }
 
+// sendStreamRunSSE 发送流式运行 SSE 事件
+// 处理工作流流式执行过程中的 Server-Sent Events 推送
+// 类似于 Spring Boot 中使用 SseEmitter 进行实时数据推送的功能
+//
+// 功能说明：
+//   - 持续读取流式数据并转换为 SSE 事件格式
+//   - 处理数据序列化和错误处理
+//   - 确保资源正确释放
+//
+// 参数：
+//   - ctx: 请求上下文，用于日志记录和超时控制
+//   - w: SSE 写入器，用于向客户端发送事件
+//   - sr: 流式数据读取器，从应用层获取实时数据
 func sendStreamRunSSE(ctx context.Context, w *sse.Writer, sr *schema.StreamReader[*workflow.OpenAPIStreamRunFlowResponse]) {
+	// 确保资源正确释放
 	defer func() {
 		_ = w.Close()
 		sr.Close()
 	}()
 
+	// 持续读取并推送流式数据
 	for {
+		// 步骤1: 从流中接收消息
 		msg, err := sr.Recv()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				// finish
+				// 步骤2: 正常结束，跳出循环
 				break
 			}
 
+			// 步骤3: 处理接收错误，发送错误事件
 			event := &sse.Event{
 				Type: "error",
 				Data: []byte(err.Error()),
@@ -954,9 +1007,11 @@ func sendStreamRunSSE(ctx context.Context, w *sse.Writer, sr *schema.StreamReade
 			return
 		}
 
+		// 步骤4: 转换数据格式
 		converted := convertStreamRunData(msg)
 		msgBytes, err := sonic.Marshal(converted)
 		if err != nil {
+			// 步骤5: 处理序列化错误
 			event := &sse.Event{
 				Type: "error",
 				Data: []byte(err.Error()),
@@ -967,6 +1022,7 @@ func sendStreamRunSSE(ctx context.Context, w *sse.Writer, sr *schema.StreamReade
 			return
 		}
 
+		// 步骤6: 构建并发送 SSE 事件
 		event := &sse.Event{
 			ID:   msg.ID,
 			Type: msg.Event,
@@ -980,16 +1036,34 @@ func sendStreamRunSSE(ctx context.Context, w *sse.Writer, sr *schema.StreamReade
 	}
 }
 
-// OpenAPIStreamRunFlow .
+// OpenAPIStreamRunFlow 执行工作流流式运行接口
+// 该函数处理工作流的流式执行请求，支持实时数据推送
+// 类似于 Spring Boot 中使用 SseEmitter 的流式响应接口
+//
+// 功能说明：
+//   - 接收工作流流式运行请求并进行参数验证
+//   - 配置 SSE (Server-Sent Events) 响应头
+//   - 调用应用层服务启动流式执行
+//   - 通过 SSE 实时推送执行过程和结果
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，通过 SSE 流式返回数据
+//
 // @router /v1/workflow/stream_run [POST]
 func OpenAPIStreamRunFlow(ctx context.Context, c *app.RequestContext) {
 	var err error
 
+	// 步骤1: 预处理请求体，进行基础校验和格式化
 	if err = preprocessWorkflowRequestBody(ctx, c); err != nil {
 		invalidParamRequestResponse(c, err.Error())
 		return
 	}
 
+	// 步骤2: 绑定并验证请求参数到结构体
 	var req workflow.OpenAPIRunFlowRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -997,26 +1071,48 @@ func OpenAPIStreamRunFlow(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤3: 创建 SSE 写入器
 	w := sse.NewWriter(c)
 
+	// 步骤4: 设置 SSE 响应头，配置流式传输
 	c.SetContentType("text/event-stream; charset=utf-8")
 	c.Response.Header.Set("Cache-Control", "no-cache")
 	c.Response.Header.Set("Connection", "keep-alive")
 	c.Response.Header.Set("Access-Control-Allow-Origin", "*")
 
+	// 步骤5: 调用应用层服务启动流式执行
 	sr, err := appworkflow.SVC.OpenAPIStreamRun(ctx, &req)
 	if err != nil {
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 步骤6: 开始 SSE 数据推送
 	sendStreamRunSSE(ctx, w, sr)
 }
 
-// OpenAPIStreamResumeFlow .
+// OpenAPIStreamResumeFlow 恢复工作流流式执行接口
+// 该函数处理工作流中断后的恢复执行请求，支持实时数据推送
+// 类似于 Spring Boot 中的断点续传或任务恢复功能
+//
+// 功能说明：
+//   - 接收工作流恢复执行请求并进行参数验证
+//   - 配置 SSE 响应头用于流式数据传输
+//   - 调用应用层服务恢复工作流执行
+//   - 通过 SSE 实时推送恢复执行的过程和结果
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，通过 SSE 流式返回数据
+//
 // @router /v1/workflow/stream_resume [POST]
 func OpenAPIStreamResumeFlow(ctx context.Context, c *app.RequestContext) {
 	var err error
+
+	// 步骤1: 绑定并验证恢复请求参数
 	var req workflow.OpenAPIStreamResumeFlowRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -1024,26 +1120,48 @@ func OpenAPIStreamResumeFlow(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤2: 创建 SSE 写入器
 	w := sse.NewWriter(c)
 
+	// 步骤3: 设置 SSE 响应头，配置流式传输
 	c.SetContentType("text/event-stream; charset=utf-8")
 	c.Response.Header.Set("Cache-Control", "no-cache")
 	c.Response.Header.Set("Connection", "keep-alive")
 	c.Response.Header.Set("Access-Control-Allow-Origin", "*")
 
+	// 步骤4: 调用应用层服务恢复流式执行
 	sr, err := appworkflow.SVC.OpenAPIStreamResume(ctx, &req)
 	if err != nil {
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 步骤5: 开始 SSE 数据推送
 	sendStreamRunSSE(ctx, w, sr)
 }
 
-// OpenAPIGetWorkflowRunHistory .
+// OpenAPIGetWorkflowRunHistory 获取工作流运行历史接口
+// 该函数处理获取工作流执行历史记录的请求
+// 类似于 Spring Boot 中的查询接口，用于获取历史数据
+//
+// 功能说明：
+//   - 接收查询工作流运行历史的请求并进行参数验证
+//   - 调用应用层服务获取历史记录
+//   - 处理业务错误和系统错误
+//   - 返回格式化的历史记录响应
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，直接通过 c.JSON 返回 HTTP 响应
+//
 // @router /v1/workflow/get_run_history [GET]
 func OpenAPIGetWorkflowRunHistory(ctx context.Context, c *app.RequestContext) {
 	var err error
+
+	// 步骤1: 绑定并验证查询请求参数
 	var req workflow.GetWorkflowRunHistoryRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -1051,8 +1169,10 @@ func OpenAPIGetWorkflowRunHistory(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤2: 调用应用层服务获取运行历史
 	resp, err := appworkflow.SVC.OpenAPIGetWorkflowRunHistory(ctx, &req)
 	if err != nil {
+		// 步骤3: 处理业务错误，将工作流特定错误转换为标准响应格式
 		var se vo.WorkflowError
 		if errors.As(err, &se) {
 			resp = new(workflow.GetWorkflowRunHistoryResponse)
@@ -1062,17 +1182,38 @@ func OpenAPIGetWorkflowRunHistory(ctx context.Context, c *app.RequestContext) {
 			return
 		}
 
+		// 步骤4: 处理系统级错误
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 步骤5: 返回成功响应
 	c.JSON(consts.StatusOK, resp)
 }
 
-// OpenAPIChatFlowRun .
+// OpenAPIChatFlowRun 聊天工作流运行接口
+// 该函数处理聊天式工作流的执行请求，提供对话式的工作流交互
+// 类似于 Spring Boot 中的聊天机器人或对话系统接口
+//
+// 功能说明：
+//   - 接收聊天工作流运行请求并进行参数验证
+//   - 处理对话式的工作流交互逻辑
+//   - 返回聊天响应结果
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，直接通过 c.JSON 返回 HTTP 响应
+//
+// 注意：当前实现为占位符，实际业务逻辑待完善
+//
 // @router /v1/workflows/chat [POST]
 func OpenAPIChatFlowRun(ctx context.Context, c *app.RequestContext) {
 	var err error
+
+	// 步骤1: 绑定并验证聊天请求参数
 	var req workflow.ChatFlowRunRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -1080,15 +1221,36 @@ func OpenAPIChatFlowRun(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤2: 创建响应对象（当前为空实现，待后续完善业务逻辑）
 	resp := new(workflow.ChatFlowRunResponse)
 
+	// 步骤3: 返回响应（当前直接返回空响应）
 	c.JSON(consts.StatusOK, resp)
 }
 
-// OpenAPIGetWorkflowInfo .
+// OpenAPIGetWorkflowInfo 获取工作流信息接口
+// 该函数处理获取指定工作流详细信息的请求
+// 类似于 Spring Boot 中的 @GetMapping("/{id}") 查询单个资源的接口
+//
+// 功能说明：
+//   - 接收工作流ID参数并进行验证
+//   - 查询并返回指定工作流的详细信息
+//   - 支持RESTful风格的路径参数
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，直接通过 c.JSON 返回 HTTP 响应
+//
+// 注意：当前实现为占位符，实际业务逻辑待完善
+//
 // @router /v1/workflows/:workflow_id [GET]
 func OpenAPIGetWorkflowInfo(ctx context.Context, c *app.RequestContext) {
 	var err error
+
+	// 步骤1: 绑定并验证路径参数（工作流ID）
 	var req workflow.OpenAPIGetWorkflowInfoRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -1096,15 +1258,34 @@ func OpenAPIGetWorkflowInfo(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤2: 创建响应对象（当前为空实现，待后续完善业务逻辑）
 	resp := new(workflow.OpenAPIGetWorkflowInfoResponse)
 
+	// 步骤3: 返回响应（当前直接返回空响应）
 	c.JSON(consts.StatusOK, resp)
 }
 
-// GetHistorySchema .
+// GetHistorySchema 获取历史记录模式接口
+// 该函数处理获取工作流历史记录数据结构模式的请求
+// 类似于 Spring Boot 中获取数据模型或元数据信息的接口
+//
+// 功能说明：
+//   - 接收历史记录模式查询请求并进行参数验证
+//   - 调用应用层服务获取历史记录的数据结构模式
+//   - 返回模式定义，用于前端动态渲染或数据处理
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，直接通过 c.JSON 返回 HTTP 响应
+//
 // @router /api/workflow_api/history_schema [POST]
 func GetHistorySchema(ctx context.Context, c *app.RequestContext) {
 	var err error
+
+	// 步骤1: 绑定并验证请求参数
 	var req workflow.GetHistorySchemaRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -1112,19 +1293,39 @@ func GetHistorySchema(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤2: 调用应用层服务获取历史记录模式
 	resp, err := appworkflow.SVC.GetHistorySchema(ctx, &req)
 	if err != nil {
+		// 步骤3: 处理系统级错误
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 步骤4: 返回成功响应
 	c.JSON(consts.StatusOK, resp)
 }
 
-// GetExampleWorkFlowList .
+// GetExampleWorkFlowList 获取示例工作流列表接口
+// 该函数处理获取示例工作流列表的请求，用于为用户提供工作流模板
+// 类似于 Spring Boot 中的模板或示例数据查询接口
+//
+// 功能说明：
+//   - 接收示例工作流列表查询请求并进行参数验证
+//   - 调用应用层服务获取预定义的示例工作流
+//   - 返回示例工作流列表，供用户参考和使用
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求级别的信息和超时控制
+//   - c: HTTP 请求上下文，包含请求和响应信息
+//
+// 返回：
+//   - 无返回值，直接通过 c.JSON 返回 HTTP 响应
+//
 // @router /api/workflow_api/example_workflow_list [POST]
 func GetExampleWorkFlowList(ctx context.Context, c *app.RequestContext) {
 	var err error
+
+	// 步骤1: 绑定并验证请求参数
 	var req workflow.GetExampleWorkFlowListRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -1132,11 +1333,14 @@ func GetExampleWorkFlowList(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	// 步骤2: 调用应用层服务获取示例工作流列表
 	resp, err := appworkflow.SVC.GetExampleWorkFlowList(ctx, &req)
 	if err != nil {
+		// 步骤3: 处理系统级错误
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	// 步骤4: 返回成功响应
 	c.JSON(consts.StatusOK, resp)
 }

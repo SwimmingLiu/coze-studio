@@ -53,36 +53,78 @@ import (
 	"github.com/coze-dev/coze-studio/backend/pkg/sonic"
 )
 
+// CanvasToWorkflowSchema 将用户可视化设计的画布转换为可执行的工作流模式
+// 这是工作流系统中最核心的转换函数，负责将前端的可视化配置转换为后端可执行的工作流定义
+// 类似于 Spring Boot 中将配置文件转换为可执行的 Bean 定义的过程
+//
+// 功能说明：
+//   - 验证画布配置的合法性和完整性
+//   - 清理孤立的节点和连线，确保工作流的连通性
+//   - 转换节点类型和属性，生成可执行的节点定义
+//   - 处理复杂的嵌套结构和批处理模式
+//   - 标准化端口连接，确保数据流的正确性
+//   - 生成最终的工作流执行模式
+//
+// 参数：
+//   - ctx: 请求上下文，用于传递请求信息和控制生命周期
+//   - s: 画布配置对象，包含用户设计的节点、连线等信息
+//
+// 返回：
+//   - *compose.WorkflowSchema: 转换后的工作流执行模式，可用于实际执行
+//   - error: 转换过程中的错误，包括格式错误、逻辑错误等
+//
+// 转换流程：
+// 1. 清理孤立节点，确保工作流连通性
+// 2. 验证节点结构和嵌套限制
+// 3. 处理批处理和循环模式
+// 4. 转换节点为可执行的节点模式
+// 5. 处理节点间的连接关系
+// 6. 标准化端口连接
+// 7. 初始化并返回工作流模式
 func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *compose.WorkflowSchema, err error) {
+	// 步骤0: 设置panic恢复机制，确保转换过程的稳定性
 	defer func() {
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
 		}
 	}()
 
+	// 步骤1: 清理孤立节点，确保工作流的连通性
+	// 移除没有连接到主要工作流的孤立节点和边，这些节点不会被执行
 	connectedNodes, connectedEdges := PruneIsolatedNodes(s.Nodes, s.Edges, nil)
 	s = &vo.Canvas{
 		Nodes: connectedNodes,
 		Edges: connectedEdges,
 	}
 
+	// 步骤2: 初始化工作流模式对象
 	sc = &compose.WorkflowSchema{}
 
+	// 步骤3: 创建节点映射表，用于快速查找和引用
 	nodeMap := make(map[string]*vo.Node)
 
+	// 步骤4: 遍历所有节点，构建节点映射并进行结构验证
 	for i, node := range s.Nodes {
+		// 步骤4.1: 建立节点ID到节点对象的映射关系
 		nodeMap[node.ID] = s.Nodes[i]
+		
+		// 步骤4.2: 处理节点内部的子块（内部工作流节点）
 		for j, subNode := range node.Blocks {
 			nodeMap[subNode.ID] = node.Blocks[j]
-			subNode.SetParent(node)
+			subNode.SetParent(node) // 建立父子关系
+			
+			// 步骤4.2.1: 验证嵌套限制 - 不支持三层及以上的嵌套
 			if len(subNode.Blocks) > 0 {
 				return nil, fmt.Errorf("nested inner-workflow is not supported")
 			}
 
+			// 步骤4.2.2: 验证内部节点不应包含边信息（边信息应在外层管理）
 			if len(subNode.Edges) > 0 {
 				return nil, fmt.Errorf("nodes in inner-workflow should not have edges info")
 			}
 
+			// 步骤4.2.3: 处理特殊的控制流节点（break/continue）
+			// 为这些节点创建到父节点的连接，实现控制流转移
 			if subNode.Type == vo.BlockTypeBotBreak || subNode.Type == vo.BlockTypeBotContinue {
 				sc.Connections = append(sc.Connections, &compose.Connection{
 					FromNode: vo.NodeKey(subNode.ID),
@@ -91,32 +133,43 @@ func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *compose.Work
 			}
 		}
 
+		// 步骤4.3: 解析和处理批处理模式
+		// 批处理模式允许对数据集合进行批量处理
 		newNode, enableBatch, err := parseBatchMode(node)
 		if err != nil {
 			return nil, err
 		}
 
 		if enableBatch {
+			// 如果启用批处理，使用转换后的节点并记录生成的节点
 			node = newNode
 			sc.GeneratedNodes = append(sc.GeneratedNodes, vo.NodeKey(node.Blocks[0].ID))
 		}
 
+		// 步骤4.4: 提取隐式依赖关系
+		// 某些节点可能有隐式的依赖关系，需要在执行时考虑
 		implicitDependencies, err := extractImplicitDependency(node, s.Nodes)
 		if err != nil {
 			return nil, err
 		}
 
+		// 步骤4.5: 准备节点转换选项
 		opts := make([]OptionFn, 0, 1)
 		if len(implicitDependencies) > 0 {
 			opts = append(opts, WithImplicitNodeDependencies(implicitDependencies))
 		}
 
+		// 步骤4.6: 将画布节点转换为可执行的节点模式
+		// 这是核心转换逻辑，将用户界面的节点转换为系统可执行的节点定义
 		nsList, hierarchy, err := NodeToNodeSchema(ctx, node, opts...)
 		if err != nil {
 			return nil, err
 		}
 
+		// 步骤4.7: 将转换后的节点添加到工作流模式中
 		sc.Nodes = append(sc.Nodes, nsList...)
+		
+		// 步骤4.8: 处理节点层次关系（用于复杂的嵌套结构）
 		if len(hierarchy) > 0 {
 			if sc.Hierarchy == nil {
 				sc.Hierarchy = make(map[vo.NodeKey]vo.NodeKey)
@@ -127,60 +180,97 @@ func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *compose.Work
 			}
 		}
 
+		// 步骤4.9: 处理节点内部的连接关系
 		for _, edge := range node.Edges {
 			sc.Connections = append(sc.Connections, EdgeToConnection(edge))
 		}
 	}
 
+	// 步骤5: 处理画布级别的连接关系
+	// 处理节点之间的主要连接，这些连接定义了工作流的执行顺序和数据流向
 	for _, edge := range s.Edges {
 		sc.Connections = append(sc.Connections, EdgeToConnection(edge))
 	}
 
+	// 步骤6: 标准化端口连接
+	// 确保所有连接的端口定义正确，数据能够正确地在节点间传递
+	// 这一步会验证连接的有效性并进行必要的格式转换
 	newConnections, err := normalizePorts(sc.Connections, nodeMap)
 	if err != nil {
 		return nil, err
 	}
 	sc.Connections = newConnections
 
+	// 步骤7: 初始化工作流模式
+	// 完成最终的初始化工作，包括验证完整性和设置默认值
 	sc.Init()
 
+	// 步骤8: 返回转换完成的工作流模式
+	// 此时的工作流模式已经可以用于实际的执行
 	return sc, nil
 }
 
+// normalizePorts 标准化端口连接配置
+// 验证和转换节点间连接的端口信息，确保数据流的正确性和一致性
+// 类似于 Spring Boot 中验证和标准化配置属性的过程
+//
+// 功能说明：
+//   - 验证端口名称的有效性，防止无效连接
+//   - 转换特定节点类型的端口格式（如条件节点的分支端口）
+//   - 处理特殊的内联端口，简化内部工作流的连接
+//   - 确保所有连接都有正确的源节点引用
+//
+// 参数：
+//   - connections: 原始的连接列表，包含用户定义的连接信息
+//   - nodeMap: 节点映射表，用于查找和验证节点信息
+//
+// 返回：
+//   - normalized: 标准化后的连接列表，可用于工作流执行
+//   - err: 验证过程中发现的错误
 func normalizePorts(connections []*compose.Connection, nodeMap map[string]*vo.Node) (normalized []*compose.Connection, err error) {
+	// 遍历所有连接进行标准化处理
 	for i := range connections {
 		conn := connections[i]
+		
+		// 步骤1: 处理没有端口信息的连接（直接通过）
 		if conn.FromPort == nil {
 			normalized = append(normalized, conn)
 			continue
 		}
 
+		// 步骤2: 处理空端口名称（清除端口信息）
 		if len(*conn.FromPort) == 0 {
 			conn.FromPort = nil
 			normalized = append(normalized, conn)
 			continue
 		}
 
+		// 步骤3: 处理特殊的内联输出端口（用于循环和批处理节点）
+		// 这些端口在内部工作流中不需要特殊处理，直接忽略端口信息
 		if *conn.FromPort == "loop-function-inline-output" || *conn.FromPort == "loop-output" ||
-			*conn.FromPort == "batch-function-inline-output" || *conn.FromPort == "batch-output" { // ignore this, we don't need this for inner workflow to work
+			*conn.FromPort == "batch-function-inline-output" || *conn.FromPort == "batch-output" {
 			conn.FromPort = nil
 			normalized = append(normalized, conn)
 			continue
 		}
 
+		// 步骤4: 验证源节点是否存在
 		node, ok := nodeMap[string(conn.FromNode)]
 		if !ok {
 			return nil, fmt.Errorf("node %s not found in node map", conn.FromNode)
 		}
 
+		// 步骤5: 根据节点类型标准化端口名称
 		var newPort string
 		switch node.Type {
 		case vo.BlockTypeCondition:
+			// 条件节点：处理 true/false 分支端口
 			if *conn.FromPort == "true" {
 				newPort = fmt.Sprintf(compose.BranchFmt, 0)
 			} else if *conn.FromPort == "false" {
 				newPort = compose.DefaultBranch
 			} else if strings.HasPrefix(*conn.FromPort, "true_") {
+				// 处理多分支条件的编号分支
 				portN := strings.TrimPrefix(*conn.FromPort, "true_")
 				n, err := strconv.Atoi(portN)
 				if err != nil {
@@ -189,16 +279,20 @@ func normalizePorts(connections []*compose.Connection, nodeMap map[string]*vo.No
 				newPort = fmt.Sprintf(compose.BranchFmt, n)
 			}
 		case vo.BlockTypeBotIntent:
+			// 意图识别节点：保持原端口名称
 			newPort = *conn.FromPort
 		case vo.BlockTypeQuestion:
+			// 问答节点：保持原端口名称
 			newPort = *conn.FromPort
 		default:
+			// 其他节点类型：只允许标准端口名称
 			if *conn.FromPort != "default" && *conn.FromPort != "branch_error" {
 				return nil, fmt.Errorf("invalid port name: %s", *conn.FromPort)
 			}
 			newPort = *conn.FromPort
 		}
 
+		// 步骤6: 创建标准化的连接对象
 		normalized = append(normalized, &compose.Connection{
 			FromNode: conn.FromNode,
 			ToNode:   conn.ToNode,
@@ -248,20 +342,50 @@ type option struct {
 }
 type OptionFn func(*option)
 
+// WithImplicitNodeDependencies 设置节点的隐式依赖关系选项
+// 某些节点可能存在隐式的依赖关系，这些依赖不通过连线表达，但在执行时需要考虑
+//
+// 参数：
+//   - implicitNodeDependencies: 隐式节点依赖关系列表
+//
+// 返回：
+//   - OptionFn: 配置选项函数
 func WithImplicitNodeDependencies(implicitNodeDependencies []*vo.ImplicitNodeDependency) OptionFn {
 	return func(o *option) {
 		o.implicitNodeDependencies = implicitNodeDependencies
 	}
 }
 
+// NodeToNodeSchema 将画布节点转换为可执行的节点模式
+// 这是节点转换的核心函数，根据节点类型选择相应的转换策略
+// 类似于 Spring Boot 中的策略模式，根据不同的 Bean 类型应用不同的处理逻辑
+//
+// 功能说明：
+//   - 根据节点类型查找对应的转换函数
+//   - 处理普通节点、子工作流节点、批处理节点、循环节点等不同类型
+//   - 生成异常处理配置
+//   - 建立节点层次关系
+//
+// 参数：
+//   - ctx: 请求上下文
+//   - n: 要转换的画布节点
+//   - opts: 转换选项，包括隐式依赖等配置
+//
+// 返回：
+//   - []*compose.NodeSchema: 转换后的节点模式列表（一个节点可能转换为多个可执行节点）
+//   - map[vo.NodeKey]vo.NodeKey: 节点层次关系映射
+//   - error: 转换过程中的错误
 func NodeToNodeSchema(ctx context.Context, n *vo.Node, opts ...OptionFn) ([]*compose.NodeSchema, map[vo.NodeKey]vo.NodeKey, error) {
+	// 步骤1: 查找普通节点类型的转换函数
 	cfg, ok := blockTypeToNodeSchema[n.Type]
 	if ok {
+		// 步骤1.1: 使用对应的转换函数转换节点
 		ns, err := cfg(n, opts...)
 		if err != nil {
 			return nil, nil, err
 		}
 
+		// 步骤1.2: 生成异常处理配置
 		if ns.ExceptionConfigs, err = toMetaConfig(n, ns.Type); err != nil {
 			return nil, nil, err
 		}
@@ -269,12 +393,15 @@ func NodeToNodeSchema(ctx context.Context, n *vo.Node, opts ...OptionFn) ([]*com
 		return []*compose.NodeSchema{ns}, nil, nil
 	}
 
+	// 步骤2: 检查是否为需要跳过的节点类型（如注释节点）
 	_, ok = blockTypeToSkip[n.Type]
 	if ok {
 		return nil, nil, nil
 	}
 
+	// 步骤3: 处理特殊的复合节点类型
 	if n.Type == vo.BlockTypeBotSubWorkflow {
+		// 子工作流节点：包含完整的子工作流逻辑
 		ns, err := toSubWorkflowNodeSchema(ctx, n)
 		if err != nil {
 			return nil, nil, err
@@ -284,25 +411,49 @@ func NodeToNodeSchema(ctx context.Context, n *vo.Node, opts ...OptionFn) ([]*com
 		}
 		return []*compose.NodeSchema{ns}, nil, nil
 	} else if n.Type == vo.BlockTypeBotBatch {
+		// 批处理节点：对数据集合进行批量处理
 		return toBatchNodeSchema(ctx, n, opts...)
 	} else if n.Type == vo.BlockTypeBotLoop {
+		// 循环节点：支持条件循环和迭代
 		return toLoopNodeSchema(ctx, n, opts...)
 	}
 
+	// 步骤4: 未支持的节点类型，返回错误
 	return nil, nil, fmt.Errorf("unsupported block type: %v", n.Type)
 }
 
+// EdgeToConnection 将画布边转换为工作流连接
+// 将用户在可视化界面中绘制的连线转换为系统可识别的节点连接关系
+// 类似于 Spring Boot 中将配置文件的依赖关系转换为实际的 Bean 依赖
+//
+// 功能说明：
+//   - 转换源节点和目标节点的标识
+//   - 处理特殊的端口连接（如循环和批处理的内联输入）
+//   - 设置端口映射关系，确保数据正确传递
+//
+// 参数：
+//   - e: 画布中的边对象，包含连接的源节点、目标节点和端口信息
+//
+// 返回：
+//   - *compose.Connection: 转换后的工作流连接对象
 func EdgeToConnection(e *vo.Edge) *compose.Connection {
+	// 步骤1: 确定目标节点
 	toNode := vo.NodeKey(e.TargetNodeID)
+	
+	// 步骤2: 处理特殊的内联输入端口
+	// 对于循环和批处理节点的内联输入，需要特殊处理为结束节点
 	if len(e.SourcePortID) > 0 && (e.TargetPortID == "loop-function-inline-input" || e.TargetPortID == "batch-function-inline-input") {
 		toNode = einoCompose.END
 	}
 
+	// 步骤3: 创建连接对象
 	conn := &compose.Connection{
 		FromNode: vo.NodeKey(e.SourceNodeID),
 		ToNode:   toNode,
 	}
 
+	// 步骤4: 设置源端口信息（如果存在）
+	// 端口信息用于确定数据从源节点的哪个输出传递到目标节点
 	if len(e.SourceNodeID) > 0 {
 		conn.FromPort = &e.SourcePortID
 	}

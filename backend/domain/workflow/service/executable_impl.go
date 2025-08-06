@@ -44,12 +44,34 @@ type executableImpl struct {
 	repo workflow.Repository
 }
 
+// SyncExecute 同步执行指定的工作流，等待执行完成后返回完整的执行结果
+// 参数说明：
+//   - ctx: 上下文，用于取消操作和传递请求信息
+//   - config: 执行配置，包含工作流ID、版本、执行模式等信息
+//   - input: 工作流的输入参数映射
+//
+// 返回值：
+//   - *entity.WorkflowExecution: 工作流执行结果实体，包含执行状态、输出、token使用情况等
+//   - vo.TerminatePlan: 终止计划，指示如何处理执行结果
+//   - error: 执行过程中的错误
+//
+// 执行流程：
+// 1. 获取工作流实体信息
+// 2. 检查应用工作流的发布版本权限
+// 3. 解析工作流画布配置
+// 4. 转换为工作流执行模式
+// 5. 创建工作流实例
+// 6. 转换输入参数
+// 7. 准备执行环境
+// 8. 同步执行工作流
+// 9. 处理执行结果并返回
 func (i *impl) SyncExecute(ctx context.Context, config vo.ExecuteConfig, input map[string]any) (*entity.WorkflowExecution, vo.TerminatePlan, error) {
 	var (
 		err      error
 		wfEntity *entity.Workflow
 	)
 
+	// 步骤1: 根据配置获取工作流实体信息
 	wfEntity, err = i.Get(ctx, &vo.GetPolicy{
 		ID:       config.ID,
 		QType:    config.From,
@@ -61,6 +83,7 @@ func (i *impl) SyncExecute(ctx context.Context, config vo.ExecuteConfig, input m
 		return nil, "", err
 	}
 
+	// 步骤2: 检查应用工作流的发布版本权限（仅对应用工作流且为发布模式时）
 	isApplicationWorkflow := wfEntity.AppID != nil
 	if isApplicationWorkflow && config.Mode == vo.ExecuteModeRelease {
 		err = i.checkApplicationWorkflowReleaseVersion(ctx, *wfEntity.AppID, config.ConnectorID, config.ID, config.Version)
@@ -69,18 +92,22 @@ func (i *impl) SyncExecute(ctx context.Context, config vo.ExecuteConfig, input m
 		}
 	}
 
+	// 步骤3: 解析工作流画布配置，将JSON字符串转换为Canvas对象
 	c := &vo.Canvas{}
 	if err = sonic.UnmarshalString(wfEntity.Canvas, c); err != nil {
 		return nil, "", fmt.Errorf("failed to unmarshal canvas: %w", err)
 	}
 
+	// 步骤4: 将画布配置转换为工作流执行模式
 	workflowSC, err := adaptor.CanvasToWorkflowSchema(ctx, c)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to convert canvas to workflow schema: %w", err)
 	}
 
+	// 步骤5: 创建工作流实例，配置工作流选项
 	var wfOpts []compose.WorkflowOption
-	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID))
+	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID)) // 使用工作流ID作为名称
+	// 如果配置了最大节点数限制，则应用该限制
 	if s := execute.GetStaticConfig(); s != nil && s.MaxNodeCountPerWorkflow > 0 {
 		wfOpts = append(wfOpts, compose.WithMaxNodeCount(s.MaxNodeCountPerWorkflow))
 	}
@@ -90,61 +117,76 @@ func (i *impl) SyncExecute(ctx context.Context, config vo.ExecuteConfig, input m
 		return nil, "", fmt.Errorf("failed to create workflow: %w", err)
 	}
 
+	// 如果工作流属于某个应用且配置中未指定应用ID，则使用工作流实体中的应用ID
 	if wfEntity.AppID != nil && config.AppID == nil {
 		config.AppID = wfEntity.AppID
 	}
 
+	// 步骤6: 转换输入参数，配置转换选项
 	var cOpts []nodes.ConvertOption
 	if config.InputFailFast {
-		cOpts = append(cOpts, nodes.FailFast())
+		cOpts = append(cOpts, nodes.FailFast()) // 快速失败模式
 	}
 
 	convertedInput, ws, err := nodes.ConvertInputs(ctx, input, wf.Inputs(), cOpts...)
 	if err != nil {
 		return nil, "", err
 	} else if ws != nil {
-		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws)
+		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws) // 记录输入转换警告
 	}
 
+	// 将输入参数序列化为JSON字符串，用于存储和追踪
 	inStr, err := sonic.MarshalString(input)
 	if err != nil {
 		return nil, "", err
 	}
 
+	// 步骤7: 准备执行环境，创建工作流运行器并获取执行上下文
 	cancelCtx, executeID, opts, lastEventChan, err := compose.NewWorkflowRunner(wfEntity.GetBasic(), workflowSC, config,
 		compose.WithInput(inStr)).Prepare(ctx)
 	if err != nil {
 		return nil, "", err
 	}
 
+	// 记录执行开始时间
 	startTime := time.Now()
 
+	// 步骤8: 同步执行工作流，等待执行完成
 	out, err := wf.SyncRun(cancelCtx, convertedInput, opts...)
 	if err != nil {
+		// 处理执行错误，区分中断错误和其他错误
 		if _, ok := einoCompose.ExtractInterruptInfo(err); !ok {
 			var wfe vo.WorkflowError
 			if errors.As(err, &wfe) {
+				// 如果是工作流错误，附加调试信息
 				return nil, "", wfe.AppendDebug(executeID, wfEntity.SpaceID, wfEntity.ID)
 			} else {
+				// 其他错误，包装为工作流执行失败错误
 				return nil, "", vo.WrapWithDebug(errno.ErrWorkflowExecuteFail, err, executeID, wfEntity.SpaceID, wfEntity.ID, errorx.KV("cause", err.Error()))
 			}
 		}
 	}
 
+	// 获取最后一个执行事件，包含执行结果和状态信息
 	lastEvent := <-lastEventChan
 
+	// 记录执行结束时间
 	updateTime := time.Now()
 
+	// 步骤9: 处理执行结果，根据终止计划决定输出格式
 	var outStr string
 	if wf.TerminatePlan() == vo.ReturnVariables {
+		// 如果终止计划是返回变量，则序列化整个输出对象
 		outStr, err = sonic.MarshalString(out)
 		if err != nil {
 			return nil, "", err
 		}
 	} else {
+		// 否则直接使用output字段的字符串值
 		outStr = out["output"].(string)
 	}
 
+	// 根据最后事件类型确定执行状态
 	var status entity.WorkflowExecuteStatus
 	switch lastEvent.Type {
 	case execute.WorkflowSuccess:
@@ -157,44 +199,65 @@ func (i *impl) SyncExecute(ctx context.Context, config vo.ExecuteConfig, input m
 		status = entity.WorkflowCancel
 	}
 
+	// 提取失败原因（如果存在错误）
 	var failReason *string
 	if lastEvent.Err != nil {
 		failReason = ptr.Of(lastEvent.Err.Error())
 	}
 
+	// 构建并返回工作流执行结果实体
 	return &entity.WorkflowExecution{
-		ID:            executeID,
-		WorkflowID:    wfEntity.ID,
-		Version:       wfEntity.GetVersion(),
-		SpaceID:       wfEntity.SpaceID,
-		ExecuteConfig: config,
-		CreatedAt:     startTime,
-		NodeCount:     workflowSC.NodeCount(),
-		Status:        status,
-		Duration:      lastEvent.Duration,
-		Input:         ptr.Of(inStr),
-		Output:        ptr.Of(outStr),
-		ErrorCode:     ptr.Of("-1"),
-		FailReason:    failReason,
-		TokenInfo: &entity.TokenUsage{
-			InputTokens:  lastEvent.GetInputTokens(),
-			OutputTokens: lastEvent.GetOutputTokens(),
+		ID:            executeID,              // 执行ID
+		WorkflowID:    wfEntity.ID,            // 工作流ID
+		Version:       wfEntity.GetVersion(),  // 工作流版本
+		SpaceID:       wfEntity.SpaceID,       // 空间ID
+		ExecuteConfig: config,                 // 执行配置
+		CreatedAt:     startTime,              // 创建时间
+		NodeCount:     workflowSC.NodeCount(), // 节点数量
+		Status:        status,                 // 执行状态
+		Duration:      lastEvent.Duration,     // 执行耗时
+		Input:         ptr.Of(inStr),          // 输入参数（JSON字符串）
+		Output:        ptr.Of(outStr),         // 输出结果（JSON字符串）
+		ErrorCode:     ptr.Of("-1"),           // 错误代码（默认-1）
+		FailReason:    failReason,             // 失败原因
+		TokenInfo: &entity.TokenUsage{ // Token使用情况
+			InputTokens:  lastEvent.GetInputTokens(),  // 输入Token数
+			OutputTokens: lastEvent.GetOutputTokens(), // 输出Token数
 		},
-		UpdatedAt:       ptr.Of(updateTime),
-		RootExecutionID: executeID,
-		InterruptEvents: lastEvent.InterruptEvents,
-	}, wf.TerminatePlan(), nil
+		UpdatedAt:       ptr.Of(updateTime),        // 更新时间
+		RootExecutionID: executeID,                 // 根执行ID
+		InterruptEvents: lastEvent.InterruptEvents, // 中断事件列表
+	}, wf.TerminatePlan(), nil // 返回执行结果、终止计划和无错误
 }
 
-// AsyncExecute executes the specified workflow asynchronously, returning the execution ID.
-// Intermediate results are not emitted on the fly.
-// The caller is expected to poll the execution status using the GetExecution method and the returned execution ID.
+// AsyncExecute 异步执行指定的工作流，立即返回执行ID而不等待执行完成
+// 与SyncExecute不同，此方法不会阻塞等待执行结果，中间结果也不会实时返回
+// 调用方需要使用返回的执行ID通过GetExecution方法轮询执行状态
+// 参数说明：
+//   - ctx: 上下文，用于取消操作和传递请求信息
+//   - config: 执行配置，包含工作流ID、版本、执行模式等信息
+//   - input: 工作流的输入参数映射
+//
+// 返回值：
+//   - int64: 执行ID，用于后续查询执行状态和结果
+//   - error: 准备执行过程中的错误（不包括执行过程中的错误）
+//
+// 执行流程：
+// 1. 获取工作流实体信息
+// 2. 检查应用工作流的发布版本权限
+// 3. 解析工作流画布配置
+// 4. 转换为工作流执行模式
+// 5. 创建工作流实例
+// 6. 转换输入参数
+// 7. 准备执行环境
+// 8. 启动异步执行并立即返回执行ID
 func (i *impl) AsyncExecute(ctx context.Context, config vo.ExecuteConfig, input map[string]any) (int64, error) {
 	var (
 		err      error
 		wfEntity *entity.Workflow
 	)
 
+	// 步骤1: 根据配置获取工作流实体信息
 	wfEntity, err = i.Get(ctx, &vo.GetPolicy{
 		ID:       config.ID,
 		QType:    config.From,
@@ -206,6 +269,7 @@ func (i *impl) AsyncExecute(ctx context.Context, config vo.ExecuteConfig, input 
 		return 0, err
 	}
 
+	// 步骤2: 检查应用工作流的发布版本权限（仅对应用工作流且为发布模式时）
 	isApplicationWorkflow := wfEntity.AppID != nil
 	if isApplicationWorkflow && config.Mode == vo.ExecuteModeRelease {
 		err = i.checkApplicationWorkflowReleaseVersion(ctx, *wfEntity.AppID, config.ConnectorID, config.ID, config.Version)
@@ -214,18 +278,22 @@ func (i *impl) AsyncExecute(ctx context.Context, config vo.ExecuteConfig, input 
 		}
 	}
 
+	// 步骤3: 解析工作流画布配置，将JSON字符串转换为Canvas对象
 	c := &vo.Canvas{}
 	if err = sonic.UnmarshalString(wfEntity.Canvas, c); err != nil {
 		return 0, fmt.Errorf("failed to unmarshal canvas: %w", err)
 	}
 
+	// 步骤4: 将画布配置转换为工作流执行模式
 	workflowSC, err := adaptor.CanvasToWorkflowSchema(ctx, c)
 	if err != nil {
 		return 0, fmt.Errorf("failed to convert canvas to workflow schema: %w", err)
 	}
 
+	// 步骤5: 创建工作流实例，配置工作流选项
 	var wfOpts []compose.WorkflowOption
-	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID))
+	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID)) // 使用工作流ID作为名称
+	// 如果配置了最大节点数限制，则应用该限制
 	if s := execute.GetStaticConfig(); s != nil && s.MaxNodeCountPerWorkflow > 0 {
 		wfOpts = append(wfOpts, compose.WithMaxNodeCount(s.MaxNodeCountPerWorkflow))
 	}
@@ -235,52 +303,83 @@ func (i *impl) AsyncExecute(ctx context.Context, config vo.ExecuteConfig, input 
 		return 0, fmt.Errorf("failed to create workflow: %w", err)
 	}
 
+	// 如果工作流属于某个应用且配置中未指定应用ID，则使用工作流实体中的应用ID
 	if wfEntity.AppID != nil && config.AppID == nil {
 		config.AppID = wfEntity.AppID
 	}
 
+	// 设置提交ID，确保执行版本的一致性
 	config.CommitID = wfEntity.CommitID
 
+	// 步骤6: 转换输入参数，配置转换选项
 	var cOpts []nodes.ConvertOption
 	if config.InputFailFast {
-		cOpts = append(cOpts, nodes.FailFast())
+		cOpts = append(cOpts, nodes.FailFast()) // 快速失败模式
 	}
 
 	convertedInput, ws, err := nodes.ConvertInputs(ctx, input, wf.Inputs(), cOpts...)
 	if err != nil {
 		return 0, err
 	} else if ws != nil {
-		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws)
+		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws) // 记录输入转换警告
 	}
 
+	// 将输入参数序列化为JSON字符串，用于存储和追踪
 	inStr, err := sonic.MarshalString(input)
 	if err != nil {
 		return 0, err
 	}
 
+	// 步骤7: 准备执行环境，创建工作流运行器并获取执行上下文
+	// 注意：这里不需要lastEventChan，因为异步执行不等待结果
 	cancelCtx, executeID, opts, _, err := compose.NewWorkflowRunner(wfEntity.GetBasic(), workflowSC, config,
 		compose.WithInput(inStr)).Prepare(ctx)
 	if err != nil {
 		return 0, err
 	}
 
+	// 如果是调试模式，记录最新的测试运行执行ID
 	if config.Mode == vo.ExecuteModeDebug {
 		if err = i.repo.SetTestRunLatestExeID(ctx, wfEntity.ID, config.Operator, executeID); err != nil {
 			logs.CtxErrorf(ctx, "failed to set test run latest exe id: %v", err)
 		}
 	}
 
+	// 步骤8: 启动异步执行，立即返回而不等待执行完成
 	wf.AsyncRun(cancelCtx, convertedInput, opts...)
 
 	return executeID, nil
 }
 
+// AsyncExecuteNode 异步执行工作流中的指定节点，立即返回执行ID而不等待执行完成
+// 与AsyncExecute不同，此方法只执行工作流中的单个节点而非整个工作流
+// 主要用于节点级别的调试和测试场景
+// 参数说明：
+//   - ctx: 上下文，用于取消操作和传递请求信息
+//   - nodeID: 要执行的节点ID
+//   - config: 执行配置，包含工作流ID、版本、执行模式等信息
+//   - input: 节点的输入参数映射
+//
+// 返回值：
+//   - int64: 执行ID，用于后续查询执行状态和结果
+//   - error: 准备执行过程中的错误（不包括执行过程中的错误）
+//
+// 执行流程：
+// 1. 获取工作流实体信息
+// 2. 检查应用工作流的发布版本权限
+// 3. 解析工作流画布配置
+// 4. 从指定节点创建工作流执行模式
+// 5. 创建节点级工作流实例
+// 6. 转换输入参数
+// 7. 准备执行环境
+// 8. 启动异步执行并立即返回执行ID
 func (i *impl) AsyncExecuteNode(ctx context.Context, nodeID string, config vo.ExecuteConfig, input map[string]any) (int64, error) {
 	var (
 		err      error
 		wfEntity *entity.Workflow
 	)
 
+	// 步骤1: 根据配置获取工作流实体信息
 	wfEntity, err = i.Get(ctx, &vo.GetPolicy{
 		ID:       config.ID,
 		QType:    config.From,
@@ -291,6 +390,7 @@ func (i *impl) AsyncExecuteNode(ctx context.Context, nodeID string, config vo.Ex
 		return 0, err
 	}
 
+	// 步骤2: 检查应用工作流的发布版本权限（仅对应用工作流且为发布模式时）
 	isApplicationWorkflow := wfEntity.AppID != nil
 	if isApplicationWorkflow && config.Mode == vo.ExecuteModeRelease {
 		err = i.checkApplicationWorkflowReleaseVersion(ctx, *wfEntity.AppID, config.ConnectorID, config.ID, config.Version)
@@ -299,63 +399,94 @@ func (i *impl) AsyncExecuteNode(ctx context.Context, nodeID string, config vo.Ex
 		}
 	}
 
+	// 步骤3: 解析工作流画布配置，将JSON字符串转换为Canvas对象
 	c := &vo.Canvas{}
 	if err = sonic.UnmarshalString(wfEntity.Canvas, c); err != nil {
 		return 0, fmt.Errorf("failed to unmarshal canvas: %w", err)
 	}
 
+	// 步骤4: 从指定节点创建工作流执行模式，只包含该节点的执行逻辑
 	workflowSC, err := adaptor.WorkflowSchemaFromNode(ctx, c, nodeID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to convert canvas to workflow schema: %w", err)
 	}
 
+	// 步骤5: 创建节点级工作流实例，使用节点ID作为键值和工作流ID作为图名
 	wf, err := compose.NewWorkflowFromNode(ctx, workflowSC, vo.NodeKey(nodeID), einoCompose.WithGraphName(fmt.Sprintf("%d", wfEntity.ID)))
 	if err != nil {
 		return 0, fmt.Errorf("failed to create workflow: %w", err)
 	}
 
+	// 步骤6: 转换输入参数，配置转换选项
 	var cOpts []nodes.ConvertOption
 	if config.InputFailFast {
-		cOpts = append(cOpts, nodes.FailFast())
+		cOpts = append(cOpts, nodes.FailFast()) // 快速失败模式
 	}
 
 	convertedInput, ws, err := nodes.ConvertInputs(ctx, input, wf.Inputs(), cOpts...)
 	if err != nil {
 		return 0, err
 	} else if ws != nil {
-		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws)
+		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws) // 记录输入转换警告
 	}
 
+	// 如果工作流属于某个应用且配置中未指定应用ID，则使用工作流实体中的应用ID
 	if wfEntity.AppID != nil && config.AppID == nil {
 		config.AppID = wfEntity.AppID
 	}
 
+	// 设置提交ID，确保执行版本的一致性
 	config.CommitID = wfEntity.CommitID
 
+	// 将输入参数序列化为JSON字符串，用于存储和追踪
 	inStr, err := sonic.MarshalString(input)
 	if err != nil {
 		return 0, err
 	}
 
+	// 步骤7: 准备执行环境，创建工作流运行器并获取执行上下文
+	// 注意：这里不需要lastEventChan，因为异步执行不等待结果
 	cancelCtx, executeID, opts, _, err := compose.NewWorkflowRunner(wfEntity.GetBasic(), workflowSC, config,
 		compose.WithInput(inStr)).Prepare(ctx)
 	if err != nil {
 		return 0, err
 	}
 
+	// 如果是节点调试模式，记录最新的节点调试执行ID
 	if config.Mode == vo.ExecuteModeNodeDebug {
 		if err = i.repo.SetNodeDebugLatestExeID(ctx, wfEntity.ID, nodeID, config.Operator, executeID); err != nil {
 			logs.CtxErrorf(ctx, "failed to set node debug latest exe id: %v", err)
 		}
 	}
 
+	// 步骤8: 启动异步执行，立即返回而不等待执行完成
 	wf.AsyncRun(cancelCtx, convertedInput, opts...)
 
 	return executeID, nil
 }
 
-// StreamExecute executes the specified workflow, returning a stream of execution events.
-// The caller is expected to receive from the returned stream immediately.
+// StreamExecute 流式执行指定的工作流，返回执行事件的流式读取器
+// 与SyncExecute和AsyncExecute不同，此方法返回一个流，调用方可以实时接收执行过程中的中间结果和事件
+// 调用方需要立即从返回的流中读取数据，否则可能导致阻塞
+// 参数说明：
+//   - ctx: 上下文，用于取消操作和传递请求信息
+//   - config: 执行配置，包含工作流ID、版本、执行模式等信息
+//   - input: 工作流的输入参数映射
+//
+// 返回值：
+//   - *schema.StreamReader[*entity.Message]: 消息流读取器，可以实时接收执行事件
+//   - error: 准备执行过程中的错误（不包括执行过程中的错误）
+//
+// 执行流程：
+// 1. 获取工作流实体信息
+// 2. 检查应用工作流的发布版本权限
+// 3. 解析工作流画布配置
+// 4. 转换为工作流执行模式
+// 5. 创建工作流实例
+// 6. 转换输入参数
+// 7. 创建流式管道
+// 8. 准备执行环境并配置流写入器
+// 9. 启动异步执行并返回流读取器
 func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input map[string]any) (*schema.StreamReader[*entity.Message], error) {
 	var (
 		err      error
@@ -363,6 +494,7 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		ws       *nodes.ConversionWarnings
 	)
 
+	// 步骤1: 根据配置获取工作流实体信息
 	wfEntity, err = i.Get(ctx, &vo.GetPolicy{
 		ID:       config.ID,
 		QType:    config.From,
@@ -374,6 +506,7 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		return nil, err
 	}
 
+	// 步骤2: 检查应用工作流的发布版本权限（仅对应用工作流且为发布模式时）
 	isApplicationWorkflow := wfEntity.AppID != nil
 	if isApplicationWorkflow && config.Mode == vo.ExecuteModeRelease {
 		err = i.checkApplicationWorkflowReleaseVersion(ctx, *wfEntity.AppID, config.ConnectorID, config.ID, config.Version)
@@ -382,18 +515,22 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		}
 	}
 
+	// 步骤3: 解析工作流画布配置，将JSON字符串转换为Canvas对象
 	c := &vo.Canvas{}
 	if err = sonic.UnmarshalString(wfEntity.Canvas, c); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal canvas: %w", err)
 	}
 
+	// 步骤4: 将画布配置转换为工作流执行模式
 	workflowSC, err := adaptor.CanvasToWorkflowSchema(ctx, c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert canvas to workflow schema: %w", err)
 	}
 
+	// 步骤5: 创建工作流实例，配置工作流选项
 	var wfOpts []compose.WorkflowOption
-	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID))
+	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID)) // 使用工作流ID作为名称
+	// 如果配置了最大节点数限制，则应用该限制
 	if s := execute.GetStaticConfig(); s != nil && s.MaxNodeCountPerWorkflow > 0 {
 		wfOpts = append(wfOpts, compose.WithMaxNodeCount(s.MaxNodeCountPerWorkflow))
 	}
@@ -403,41 +540,50 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		return nil, fmt.Errorf("failed to create workflow: %w", err)
 	}
 
+	// 如果工作流属于某个应用且配置中未指定应用ID，则使用工作流实体中的应用ID
 	if wfEntity.AppID != nil && config.AppID == nil {
 		config.AppID = wfEntity.AppID
 	}
 
+	// 设置提交ID，确保执行版本的一致性
 	config.CommitID = wfEntity.CommitID
 
+	// 步骤6: 转换输入参数，配置转换选项
 	var cOpts []nodes.ConvertOption
 	if config.InputFailFast {
-		cOpts = append(cOpts, nodes.FailFast())
+		cOpts = append(cOpts, nodes.FailFast()) // 快速失败模式
 	}
 
 	input, ws, err = nodes.ConvertInputs(ctx, input, wf.Inputs(), cOpts...)
 	if err != nil {
 		return nil, err
 	} else if ws != nil {
-		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws)
+		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws) // 记录输入转换警告
 	}
 
+	// 将输入参数序列化为JSON字符串，用于存储和追踪
 	inStr, err := sonic.MarshalString(input)
 	if err != nil {
 		return nil, err
 	}
 
+	// 步骤7: 创建流式管道，设置缓冲区大小为10
 	sr, sw := schema.Pipe[*entity.Message](10)
 
+	// 步骤8: 准备执行环境，创建工作流运行器并配置流写入器
 	cancelCtx, executeID, opts, _, err := compose.NewWorkflowRunner(wfEntity.GetBasic(), workflowSC, config,
 		compose.WithInput(inStr), compose.WithStreamWriter(sw)).Prepare(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	// 执行ID在流式执行中暂未使用，但保留用于未来扩展
 	_ = executeID
 
+	// 步骤9: 启动异步执行，执行事件将通过流式管道实时传递
 	wf.AsyncRun(cancelCtx, input, opts...)
 
+	// 返回流读取器，调用方可以实时接收执行事件
 	return sr, nil
 }
 
