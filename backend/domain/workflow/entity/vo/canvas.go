@@ -105,53 +105,112 @@ type Data struct {
 	Size any `json:"size,omitempty"`
 }
 
+// Inputs 工作流节点输入配置
+// 定义工作流节点的所有输入信息，包括通用输入字段和各种节点类型的专用配置
 type Inputs struct {
-	// InputParameters are the fields defined by user for this particular node.
+	// InputParameters 用户自定义输入参数列表
+	// 用户在工作流画布上为该节点定义的自定义输入字段，每个字段包含名称、类型和数据源配置
 	InputParameters []*Param `json:"inputParameters"`
 
-	// SettingOnError configures common error handling strategy for nodes.
-	// NOTE: enable in frontend node's form first.
+	// SettingOnError 错误处理策略配置
+	// 配置当节点执行出错时的处理策略，如重试、跳过、终止等
+	// 注意：需要在前端节点表单中先启用此功能
 	SettingOnError *SettingOnError `json:"settingOnError,omitempty"`
 
-	// NodeBatchInfo configures batch mode for nodes.
-	// NOTE: not to be confused with NodeTypeBatch.
+	// NodeBatchInfo 节点批处理模式配置
+	// 配置节点的批量处理参数，如批处理大小、并发数等
+	// 注意：这与 NodeTypeBatch 类型的节点不同，这是通用的批处理能力
 	NodeBatchInfo *NodeBatch `json:"batch,omitempty"`
 
-	// LLMParam may be one of the LLMParam or IntentDetectorLLMParam or SimpleLLMParam.
-	// Shared between most nodes requiring an ChatModel to function.
+	// LLMParam 大语言模型参数配置
+	// 可以是以下三种类型之一：LLMParam、IntentDetectorLLMParam 或 SimpleLLMParam
+	// 为需要使用聊天模型功能的节点提供共享的模型配置参数
 	LLMParam any `json:"llmParam,omitempty"`
 
-	*OutputEmitter      // exclusive configurations for NodeTypeEmitter and NodeTypeExit in Answer mode
-	*Exit               // exclusive configurations for NodeTypeExit
-	*LLM                // exclusive configurations for NodeTypeLLM
-	*Loop               // exclusive configurations for NodeTypeLoop
-	*Selector           // exclusive configurations for NodeTypeSelector
-	*TextProcessor      // exclusive configurations for NodeTypeTextProcessor
-	*SubWorkflow        // exclusive configurations for NodeTypeSubWorkflow
-	*IntentDetector     // exclusive configurations for NodeTypeIntentDetector
-	*DatabaseNode       // exclusive configurations for various Database nodes
-	*HttpRequestNode    // exclusive configurations for NodeTypeHTTPRequester
-	*Knowledge          // exclusive configurations for various Knowledge nodes
-	*CodeRunner         // exclusive configurations for NodeTypeCodeRunner
-	*PluginAPIParam     // exclusive configurations for NodeTypePlugin
-	*VariableAggregator // exclusive configurations for NodeTypeVariableAggregator
-	*VariableAssigner   // exclusive configurations for NodeTypeVariableAssigner
-	*QA                 // exclusive configurations for NodeTypeQuestionAnswer
-	*Batch              // exclusive configurations for NodeTypeBatch
-	*Comment            // exclusive configurations for NodeTypeComment
-	*InputReceiver      // exclusive configurations for NodeTypeInputReceiver
+	// OutputEmitter 输出发射器专用配置
+	// 专用于 NodeTypeEmitter 和 Answer 模式下的 NodeTypeExit 节点
+	*OutputEmitter
+	// Exit 退出节点专用配置
+	// 专用于 NodeTypeExit 类型节点的终止计划配置
+	*Exit
+	// LLM 大语言模型节点专用配置
+	// 专用于 NodeTypeLLM 类型节点的函数调用能力配置
+	*LLM
+	// Loop 循环节点专用配置
+	// 专用于 NodeTypeLoop 类型节点的循环逻辑配置
+	*Loop
+	// Selector 选择器节点专用配置
+	// 专用于 NodeTypeSelector 类型节点的分支条件配置
+	*Selector
+	// TextProcessor 文本处理节点专用配置
+	// 专用于 NodeTypeTextProcessor 类型节点的文本处理方法配置
+	*TextProcessor
+	// SubWorkflow 子工作流节点专用配置
+	// 专用于 NodeTypeSubWorkflow 类型节点的子工作流调用配置
+	*SubWorkflow
+	// IntentDetector 意图检测节点专用配置
+	// 专用于 NodeTypeIntentDetector 类型节点的意图识别配置
+	*IntentDetector
+	// DatabaseNode 数据库节点专用配置
+	// 专用于各种数据库操作类型节点的数据库连接和查询配置
+	*DatabaseNode
+	// HttpRequestNode HTTP请求节点专用配置
+	// 专用于 NodeTypeHTTPRequester 类型节点的HTTP请求配置
+	*HttpRequestNode
+	// Knowledge 知识库节点专用配置
+	// 专用于各种知识库类型节点的知识检索和处理配置
+	*Knowledge
+	// CodeRunner 代码运行节点专用配置
+	// 专用于 NodeTypeCodeRunner 类型节点的代码执行配置
+	*CodeRunner
+	// PluginAPIParam 插件API节点专用配置
+	// 专用于 NodeTypePlugin 类型节点的插件调用配置
+	*PluginAPIParam
+	// VariableAggregator 变量聚合节点专用配置
+	// 专用于 NodeTypeVariableAggregator 类型节点的变量合并配置
+	*VariableAggregator
+	// VariableAssigner 变量赋值节点专用配置
+	// 专用于 NodeTypeVariableAssigner 类型节点的变量赋值配置
+	*VariableAssigner
+	// QA 问答节点专用配置
+	// 专用于 NodeTypeQuestionAnswer 类型节点的问答逻辑配置
+	*QA
+	// Batch 批处理节点专用配置
+	// 专用于 NodeTypeBatch 类型节点的批量处理配置
+	*Batch
+	// Comment 注释节点专用配置
+	// 专用于 NodeTypeComment 类型节点的注释内容配置
+	*Comment
+	// InputReceiver 输入接收节点专用配置
+	// 专用于 NodeTypeInputReceiver 类型节点的输入接收配置
+	*InputReceiver
 }
 
+// OutputEmitter 输出发射器节点配置
+// 用于配置输出发射器节点和Answer模式下的退出节点的输出行为
 type OutputEmitter struct {
-	Content         *BlockInput `json:"content"`
-	StreamingOutput bool        `json:"streamingOutput,omitempty"`
+	// Content 输出内容配置
+	// 定义节点输出的具体内容，可以是静态文本或动态引用其他节点的输出
+	Content *BlockInput `json:"content"`
+	// StreamingOutput 是否启用流式输出
+	// 当设置为true时，输出内容将以流的形式逐步返回，适用于长文本生成场景
+	StreamingOutput bool `json:"streamingOutput,omitempty"`
 }
 
+// Exit 退出节点配置
+// 用于配置工作流的退出行为和终止策略
 type Exit struct {
+	// TerminatePlan 终止计划配置
+	// 定义工作流的终止条件和终止后的处理逻辑
 	TerminatePlan *TerminatePlan `json:"terminatePlan,omitempty"`
 }
 
+// LLM 大语言模型节点专用配置
+// 专门用于LLM节点的高级功能配置，主要是函数调用能力
 type LLM struct {
+	// FCParam 函数调用参数配置
+	// 配置LLM节点可以调用的外部工具和服务，包括子工作流、插件API和知识库检索
+	// 这是实现AI Agent功能的关键配置，让LLM具备调用外部工具的能力
 	FCParam *FCParam `json:"fcParam,omitempty"`
 }
 
@@ -185,17 +244,45 @@ type VariableAssigner struct {
 	VariableTypeMap map[string]any `json:"variableTypeMap,omitempty"`
 }
 
+// LLMParam 标准大语言模型参数类型
+// 定义为Param数组，用于配置LLM节点的各种模型参数
+// 每个Param包含参数名称和对应的输入配置，支持动态参数绑定
 type LLMParam = []*Param
+
+// IntentDetectorLLMParam 意图检测专用LLM参数类型
+// 使用键值对映射的方式存储意图检测节点特有的LLM配置参数
+// 提供更灵活的参数配置方式，适用于复杂的意图识别场景
 type IntentDetectorLLMParam = map[string]any
+
+// SimpleLLMParam 简化的大语言模型参数配置
+// 提供直接的字段映射方式配置LLM参数，适用于简单的模型调用场景
 type SimpleLLMParam struct {
-	GenerationDiversity string               `json:"generationDiversity"`
-	MaxTokens           int                  `json:"maxTokens"`
-	ModelName           string               `json:"modelName"`
-	ModelType           int64                `json:"modelType"`
-	ResponseFormat      model.ResponseFormat `json:"responseFormat"`
-	SystemPrompt        string               `json:"systemPrompt"`
-	Temperature         float64              `json:"temperature"`
-	TopP                float64              `json:"topP"`
+	// GenerationDiversity 生成多样性配置
+	// 控制模型输出的多样性程度，影响生成内容的创新性
+	GenerationDiversity string `json:"generationDiversity"`
+	// MaxTokens 最大生成令牌数
+	// 限制模型单次生成的最大token数量，控制输出长度
+	MaxTokens int `json:"maxTokens"`
+	// ModelName 模型名称
+	// 指定要使用的具体模型名称，如gpt-3.5-turbo、gpt-4等
+	ModelName string `json:"modelName"`
+	// ModelType 模型类型标识
+	// 用于区分不同类型的模型，如聊天模型、补全模型等
+	ModelType int64 `json:"modelType"`
+	// ResponseFormat 响应格式配置
+	// 指定模型输出的格式，支持文本、JSON、Markdown等格式
+	ResponseFormat model.ResponseFormat `json:"responseFormat"`
+	// SystemPrompt 系统提示词
+	// 定义模型的系统级指令，设定模型的角色和行为规范
+	SystemPrompt string `json:"systemPrompt"`
+	// Temperature 温度参数
+	// 控制模型输出的随机性，范围通常为0.0-1.0，值越高输出越随机
+	// 通过调整softmax概率分布的平滑度来影响词汇选择的确定性
+	Temperature float64 `json:"temperature"`
+	// TopP 核采样参数
+	// 控制模型生成时考虑的词汇概率质量，影响输出的多样性和质量
+	// 通过设置概率累积阈值来限制候选词汇的范围，范围通常为0.0-1.0
+	TopP float64 `json:"topP"`
 }
 
 type QA struct {
@@ -228,46 +315,97 @@ type RequestParameter struct {
 	Name string
 }
 
+// FCParam 函数调用参数配置
+// 用于配置工作流中不同类型的函数调用能力，包括子工作流调用、插件API调用和知识库检索调用
 type FCParam struct {
+	// WorkflowFCParam 工作流函数调用参数配置
+	// 配置当前工作流可以调用的子工作流列表及其参数设置
 	WorkflowFCParam *struct {
+		// WorkflowList 可调用的工作流列表
+		// 每个工作流项包含工作流标识、版本信息和函数调用设置
 		WorkflowList []struct {
-			WorkflowID      string `json:"workflow_id"`
+			// WorkflowID 工作流唯一标识符
+			WorkflowID string `json:"workflow_id"`
+			// WorkflowVersion 工作流版本号
 			WorkflowVersion string `json:"workflow_version"`
-			PluginID        string `json:"plugin_id"`
-			PluginVersion   string `json:"plugin_version"`
-			IsDraft         bool   `json:"is_draft"`
-			FCSetting       *struct {
-				RequestParameters  []*workflow.APIParameter `json:"request_params"`
+			// PluginID 关联的插件ID（如果工作流基于插件）
+			PluginID string `json:"plugin_id"`
+			// PluginVersion 插件版本号
+			PluginVersion string `json:"plugin_version"`
+			// IsDraft 是否为草稿版本
+			IsDraft bool `json:"is_draft"`
+			// FCSetting 函数调用设置
+			// 定义调用该工作流时的请求和响应参数结构
+			FCSetting *struct {
+				// RequestParameters 请求参数列表
+				// 定义调用工作流时需要传入的参数
+				RequestParameters []*workflow.APIParameter `json:"request_params"`
+				// ResponseParameters 响应参数列表
+				// 定义工作流执行完成后返回的参数
 				ResponseParameters []*workflow.APIParameter `json:"response_params"`
 			} `json:"fc_setting,omitempty"`
 		} `json:"workflowList,omitempty"`
 	} `json:"workflowFCParam,omitempty"`
+
+	// PluginFCParam 插件函数调用参数配置
+	// 配置当前工作流可以调用的插件API列表及其参数设置
 	PluginFCParam *struct {
+		// PluginList 可调用的插件列表
+		// 每个插件项包含插件标识、API信息和函数调用设置
 		PluginList []struct {
-			PluginID      string `json:"plugin_id"`
-			ApiId         string `json:"api_id"`
-			ApiName       string `json:"api_name"`
+			// PluginID 插件唯一标识符
+			PluginID string `json:"plugin_id"`
+			// ApiId API接口唯一标识符
+			ApiId string `json:"api_id"`
+			// ApiName API接口名称
+			ApiName string `json:"api_name"`
+			// PluginVersion 插件版本号
 			PluginVersion string `json:"plugin_version"`
-			IsDraft       bool   `json:"is_draft"`
-			FCSetting     *struct {
-				RequestParameters  []*workflow.APIParameter `json:"request_params"`
+			// IsDraft 是否为草稿版本
+			IsDraft bool `json:"is_draft"`
+			// FCSetting 函数调用设置
+			// 定义调用该插件API时的请求和响应参数结构
+			FCSetting *struct {
+				// RequestParameters 请求参数列表
+				// 定义调用插件API时需要传入的参数
+				RequestParameters []*workflow.APIParameter `json:"request_params"`
+				// ResponseParameters 响应参数列表
+				// 定义插件API执行完成后返回的参数
 				ResponseParameters []*workflow.APIParameter `json:"response_params"`
 			} `json:"fc_setting,omitempty"`
 		}
 	} `json:"pluginFCParam,omitempty"`
 
+	// KnowledgeFCParam 知识库函数调用参数配置
+	// 配置当前工作流的知识库检索功能及其全局设置
 	KnowledgeFCParam *struct {
+		// GlobalSetting 知识库检索全局设置
+		// 定义知识库检索的通用配置参数
 		GlobalSetting *struct {
-			SearchMode                   int64   `json:"search_mode"`
-			TopK                         int64   `json:"top_k"`
-			MinScore                     float64 `json:"min_score"`
-			UseNL2SQL                    bool    `json:"use_nl2_sql"`
-			UseRewrite                   bool    `json:"use_rewrite"`
-			UseRerank                    bool    `json:"use_rerank"`
-			NoRecallReplyCustomizePrompt string  `json:"no_recall_reply_customize_prompt"`
-			NoRecallReplyMode            int64   `json:"no_recall_reply_mode"`
+			// SearchMode 搜索模式
+			// 定义知识库检索使用的搜索算法模式
+			SearchMode int64 `json:"search_mode"`
+			// TopK 返回结果数量
+			// 定义知识库检索返回的最大结果数量
+			TopK int64 `json:"top_k"`
+			// MinScore 最小相似度分数
+			// 定义知识库检索结果的最小相似度阈值
+			MinScore float64 `json:"min_score"`
+			// UseNL2SQL 是否启用自然语言转SQL功能
+			UseNL2SQL bool `json:"use_nl2_sql"`
+			// UseRewrite 是否启用查询重写功能
+			UseRewrite bool `json:"use_rewrite"`
+			// UseRerank 是否启用结果重排序功能
+			UseRerank bool `json:"use_rerank"`
+			// NoRecallReplyCustomizePrompt 无召回结果时的自定义回复提示词
+			NoRecallReplyCustomizePrompt string `json:"no_recall_reply_customize_prompt"`
+			// NoRecallReplyMode 无召回结果时的回复模式
+			NoRecallReplyMode int64 `json:"no_recall_reply_mode"`
 		} `json:"global_setting,omitempty"`
+		// KnowledgeList 可检索的知识库列表
+		// 定义当前工作流可以检索的知识库集合
 		KnowledgeList []*struct {
+			// ID 知识库唯一标识符
 			ID string `json:"id"`
 		} `json:"knowledgeList,omitempty"`
 	} `json:"knowledgeFCParam,omitempty"`
@@ -308,25 +446,68 @@ type CodeRunner struct {
 	Language int64  `json:"language"`
 }
 
+// Knowledge 知识库节点配置
+// 用于配置独立的知识库检索节点，定义数据源参数和处理策略
+// 与LLM节点中的KnowledgeFCParam不同，这是专门的知识库检索步骤
 type Knowledge struct {
-	DatasetParam  []*Param      `json:"datasetParam,omitempty"`
+	// DatasetParam 数据集参数配置
+	// 定义知识库的数据源配置，包括数据库连接、文件路径等信息
+	// 每个Param包含具体的数据源配置项
+	DatasetParam []*Param `json:"datasetParam,omitempty"`
+	// StrategyParam 知识库处理策略参数
+	// 定义文档解析、分块、索引等各个环节的处理策略和参数
 	StrategyParam StrategyParam `json:"strategyParam,omitempty"`
 }
 
+// StrategyParam 知识库处理策略参数配置
+// 定义知识库从文档解析到向量索引的完整处理流程策略
 type StrategyParam struct {
+	// ParsingStrategy 文档解析策略配置
+	// 定义如何解析和提取不同类型文档的内容
 	ParsingStrategy struct {
-		ParsingType     string `json:"parsingType,omitempty"`
-		ImageExtraction bool   `json:"imageExtraction"`
-		TableExtraction bool   `json:"tableExtraction"`
-		ImageOcr        bool   `json:"imageOcr"`
+		// ParsingType 解析类型
+		// 定义文档解析的方式，如自动识别、手动指定等
+		// 常见值：auto（自动识别）、manual（手动指定）、custom（自定义）
+		ParsingType string `json:"parsingType,omitempty"`
+		// ImageExtraction 是否提取图片
+		// 控制是否从文档中提取图片内容进行处理
+		// true表示提取图片，false表示忽略图片内容
+		ImageExtraction bool `json:"imageExtraction"`
+		// TableExtraction 是否提取表格
+		// 控制是否从文档中提取表格结构和数据
+		// true表示解析表格结构，false表示将表格视为普通文本
+		TableExtraction bool `json:"tableExtraction"`
+		// ImageOcr 是否启用图片OCR识别
+		// 控制是否对提取的图片进行光学字符识别
+		// true表示对图片进行OCR文字识别，false表示忽略图片中的文字
+		ImageOcr bool `json:"imageOcr"`
 	} `json:"parsingStrategy,omitempty"`
+	// ChunkStrategy 文档分块策略配置
+	// 定义如何将长文档切分成适合向量化的小块
 	ChunkStrategy struct {
-		ChunkType     string  `json:"chunkType,omitempty"`
-		SeparatorType string  `json:"separatorType,omitempty"`
-		Separator     string  `json:"separator,omitempty"`
-		MaxToken      int64   `json:"maxToken,omitempty"`
-		Overlap       float64 `json:"overlap,omitempty"`
+		// ChunkType 分块类型
+		// 定义文档分块的策略类型
+		// 常见值：fixed（固定长度）、semantic（语义分块）、sentence（句子分块）
+		ChunkType string `json:"chunkType,omitempty"`
+		// SeparatorType 分隔符类型
+		// 定义用于分块的分隔符类型
+		// 常见值：auto（自动选择）、newline（换行符）、paragraph（段落）、custom（自定义）
+		SeparatorType string `json:"separatorType,omitempty"`
+		// Separator 自定义分隔符
+		// 当SeparatorType为custom时，指定具体的分隔符字符串
+		Separator string `json:"separator,omitempty"`
+		// MaxToken 最大令牌数
+		// 定义每个文档块的最大token数量，控制块的大小
+		// 通常设置为模型的上下文窗口大小，如512、1024等
+		MaxToken int64 `json:"maxToken,omitempty"`
+		// Overlap 重叠比例
+		// 定义相邻文档块之间的重叠比例，避免语义信息在边界处丢失
+		// 取值范围0.0-1.0，常见值为0.1-0.2（10%-20%重叠）
+		Overlap float64 `json:"overlap,omitempty"`
 	} `json:"chunkStrategy,omitempty"`
+	// IndexStrategy 索引策略配置
+	// 定义向量索引的构建策略，如索引类型、参数等
+	// 具体结构依赖于使用的向量数据库类型（如HNSW、IVF等）
 	IndexStrategy any `json:"indexStrategy"`
 }
 
@@ -445,73 +626,125 @@ type Intent struct {
 	Name string `json:"name"`
 }
 
-// Param is a node's field with type and source info.
+// Param 节点参数配置
+// 定义节点的字段参数，包含字段名称、类型信息和数据源配置
+// 是工作流节点输入输出的基本数据结构
 type Param struct {
-	// Name is the field's name.
+	// Name 参数字段名称
+	// 定义该参数在节点中的标识名称，用于参数引用和数据绑定
 	Name string `json:"name,omitempty"`
 
-	// Input is the configurations for normal, singular field.
+	// Input 普通单一字段的输入配置
+	// 配置该参数的数据类型、数据源和默认值等信息
+	// 适用于大部分标准的参数配置场景
 	Input *BlockInput `json:"input,omitempty"`
 
-	// Left is the configurations for the left half of an expression,
-	// such as an assignment in NodeTypeVariableAssigner.
+	// Left 表达式左半部分的配置
+	// 用于配置表达式类操作中的左操作数
+	// 主要在 NodeTypeVariableAssigner 等赋值类节点中使用
 	Left *BlockInput `json:"left,omitempty"`
 
-	// Right is the configuration for the right half of an expression.
+	// Right 表达式右半部分的配置
+	// 用于配置表达式类操作中的右操作数
+	// 与Left配合使用，完成赋值、计算等表达式操作
 	Right *BlockInput `json:"right,omitempty"`
 
-	// Variables are configurations for a group of fields.
-	// Only used in NodeTypeVariableAggregator.
+	// Variables 字段组配置
+	// 用于配置一组相关字段的集合
+	// 仅在 NodeTypeVariableAggregator 等变量聚合节点中使用
 	Variables []*BlockInput `json:"variables,omitempty"`
 }
 
-// Variable is the configuration of a node's field, either input or output.
+// Variable 节点字段变量配置
+// 定义节点字段的配置信息，可用于输入字段或输出字段
+// 包含字段的类型、约束条件和元数据信息
 type Variable struct {
-	// Name is the field's name as defined on canvas.
+	// Name 字段名称
+	// 在工作流画布上定义的字段标识名称
 	Name string `json:"name"`
 
-	// Type is the field's data type, such as string, integer, number, object, array, etc.
+	// Type 字段数据类型
+	// 定义字段的基本数据类型，如string、integer、number、object、array等
 	Type VariableType `json:"type"`
 
-	// Required is set to true if you checked the 'required box' on this field
+	// Required 是否为必填字段
+	// 当在字段配置中勾选'必填'选项时设置为true
 	Required bool `json:"required,omitempty"`
 
-	// AssistType is the 'secondary' type of string fields, such as different types of file and image, or time.
+	// AssistType 辅助类型
+	// 字符串字段的'二级'类型，如不同类型的文件、图片或时间格式
+	// 提供更精确的类型描述，用于前端展示和数据验证
 	AssistType AssistType `json:"assistType,omitempty"`
 
-	// Schema contains detailed info for sub-fields of an object field, or element type of an array.
-	Schema any `json:"schema,omitempty"` // either []*Variable (for object) or *Variable (for list)
+	// Schema 字段结构定义
+	// 包含对象字段的子字段详细信息或数组元素的类型信息
+	// 对于object类型为[]*Variable，对于array类型为*Variable
+	Schema any `json:"schema,omitempty"`
 
-	// Description describes the field's intended use. Used on Entry node. Useful for workflow tools.
+	// Description 字段描述信息
+	// 描述字段的预期用途和含义，主要用于Entry节点
+	// 对工作流工具的使用很有帮助，提供字段的语义说明
 	Description string `json:"description,omitempty"`
 
-	// ReadOnly indicates a field is not to be set by Node's business logic.
-	// e.g. the ErrorBody field when exception strategy is configured.
+	// ReadOnly 只读字段标识
+	// 标识该字段不应被节点的业务逻辑修改
+	// 例如：配置异常策略时的ErrorBody字段
 	ReadOnly bool `json:"readOnly,omitempty"`
 
-	// DefaultValue configures the 'default value' if this field is missing in input.
-	// Effective only in Entry node.
+	// DefaultValue 默认值配置
+	// 当输入中缺少该字段时使用的默认值
+	// 仅在Entry节点中生效
 	DefaultValue any `json:"defaultValue,omitempty"`
 }
 
+// BlockInput 块输入配置
+// 定义工作流节点中单个输入块的完整配置信息
+// 包含数据类型、结构定义和具体的输入值配置
 type BlockInput struct {
-	Type       VariableType     `json:"type,omitempty" yaml:"Type,omitempty"`
-	AssistType AssistType       `json:"assistType,omitempty" yaml:"AssistType,omitempty"`
-	Schema     any              `json:"schema,omitempty" yaml:"Schema,omitempty"` // either *BlockInput(or *Variable) for list or []*Variable (for object)
-	Value      *BlockInputValue `json:"value,omitempty" yaml:"Value,omitempty"`
+	// Type 输入块的数据类型
+	// 定义该输入块接受的基本数据类型，如string、number、object等
+	Type VariableType `json:"type,omitempty" yaml:"Type,omitempty"`
+	// AssistType 辅助数据类型
+	// 提供更具体的类型描述，用于特殊类型的数据处理和验证
+	AssistType AssistType `json:"assistType,omitempty" yaml:"AssistType,omitempty"`
+	// Schema 数据结构定义
+	// 定义复杂数据类型的内部结构
+	// 对于数组类型为*BlockInput或*Variable，对于对象类型为[]*Variable
+	Schema any `json:"schema,omitempty" yaml:"Schema,omitempty"`
+	// Value 输入值配置
+	// 定义该输入块的具体数值来源和内容
+	Value *BlockInputValue `json:"value,omitempty" yaml:"Value,omitempty"`
 }
 
+// BlockInputValue 块输入值配置
+// 定义输入块的具体值内容和值的来源类型
 type BlockInputValue struct {
-	Type    BlockInputValueType `json:"type"`
-	Content any                 `json:"content,omitempty"` // either string for text such as template, or BlockInputReference
-	RawMeta any                 `json:"rawMeta,omitempty"`
+	// Type 输入值类型
+	// 标识该值是静态文本、模板字符串还是对其他节点的引用
+	Type BlockInputValueType `json:"type"`
+	// Content 输入值内容
+	// 可以是字符串类型的文本或模板，也可以是BlockInputReference类型的节点引用
+	Content any `json:"content,omitempty"`
+	// RawMeta 原始元数据
+	// 存储与该输入值相关的原始元数据信息，用于高级配置和调试
+	RawMeta any `json:"rawMeta,omitempty"`
 }
 
+// BlockInputReference 块输入引用配置
+// 定义对其他节点输出的引用配置，实现节点间的数据流转
 type BlockInputReference struct {
-	BlockID string        `json:"blockID"`
-	Name    string        `json:"name,omitempty"`
-	Path    []string      `json:"path,omitempty"`
-	Source  RefSourceType `json:"source"`
+	// BlockID 被引用的节点ID
+	// 指向提供数据的源节点的唯一标识符
+	BlockID string `json:"blockID"`
+	// Name 引用的字段名称
+	// 指定要引用的源节点输出字段的名称
+	Name string `json:"name,omitempty"`
+	// Path 引用路径
+	// 用于访问复杂对象中嵌套字段的路径数组
+	Path []string `json:"path,omitempty"`
+	// Source 引用源类型
+	// 标识引用的数据来源类型，如节点输出、全局变量等
+	Source RefSourceType `json:"source"`
 }
 
 type Condition struct {

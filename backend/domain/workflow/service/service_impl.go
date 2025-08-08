@@ -347,13 +347,28 @@ func getAllSubWorkflowIdentities(c *vo.Canvas) []*workflowIdentity {
 	return workflowEntities
 }
 
+/**
+ * 验证工作流树结构的完整性和有效性.
+ * 该方法不仅验证主工作流的结构，还会递归验证所有子工作流的有效性，
+ * 确保整个工作流树的节点连接、配置参数等都符合业务规范。
+ *
+ * @param ctx 上下文对象，用于控制请求生命周期和传递元数据
+ * @param id 主工作流ID，用于标识当前验证的工作流
+ * @param validateConfig 验证配置对象，包含画布结构、应用ID等验证所需信息
+ * @return 验证信息列表，包含主工作流及所有子工作流的验证错误信息；验证失败时返回错误
+ * @throws ErrSerializationDeserializationFail 当画布结构反序列化失败时抛出
+ */
 func (i *impl) ValidateTree(ctx context.Context, id int64, validateConfig vo.ValidateTreeConfig) ([]*cloudworkflow.ValidateTreeInfo, error) {
+	// 初始化验证结果集合
 	wfValidateInfos := make([]*cloudworkflow.ValidateTreeInfo, 0)
+
+	// 1. 验证主工作流的结构有效性
 	issues, err := validateWorkflowTree(ctx, validateConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to validate work flow: %w", err)
 	}
 
+	// 2. 如果主工作流存在验证错误，添加到结果集合中
 	if len(issues) > 0 {
 		wfValidateInfos = append(wfValidateInfos, &cloudworkflow.ValidateTreeInfo{
 			WorkflowID: strconv.FormatInt(id, 10),
@@ -361,6 +376,7 @@ func (i *impl) ValidateTree(ctx context.Context, id int64, validateConfig vo.Val
 		})
 	}
 
+	// 3. 解析画布结构以获取子工作流信息
 	c := &vo.Canvas{}
 	err = sonic.UnmarshalString(validateConfig.CanvasSchema, &c)
 	if err != nil {
@@ -368,20 +384,25 @@ func (i *impl) ValidateTree(ctx context.Context, id int64, validateConfig vo.Val
 			fmt.Errorf("failed to unmarshal canvas schema: %w", err))
 	}
 
+	// 4. 提取所有子工作流的标识信息
 	subWorkflowIdentities := getAllSubWorkflowIdentities(c)
 
+	// 5. 递归验证所有子工作流
 	if len(subWorkflowIdentities) > 0 {
 		var ids []int64
+		// 5.1. 筛选出需要验证的项目级子工作流ID（排除已发布版本的工作流）
 		for _, e := range subWorkflowIdentities {
 			if e.Version != "" {
 				continue
 			}
-			// only project-level workflows need to validate sub-workflows
+			// 只有项目级工作流需要验证子工作流
 			ids = append(ids, cast.ToInt64(e.ID)) // TODO: this should be int64 from the start
 		}
 		if len(ids) == 0 {
 			return wfValidateInfos, nil
 		}
+
+		// 5.2. 批量获取子工作流的详细信息
 		workflows, _, err := i.MGet(ctx, &vo.MGetPolicy{
 			MetaQuery: vo.MetaQuery{
 				IDs: ids,
@@ -392,15 +413,17 @@ func (i *impl) ValidateTree(ctx context.Context, id int64, validateConfig vo.Val
 			return nil, err
 		}
 
+		// 5.3. 逐个验证每个子工作流的结构
 		for _, wf := range workflows {
 			issues, err = validateWorkflowTree(ctx, vo.ValidateTreeConfig{
 				CanvasSchema: wf.Canvas,
-				AppID:        wf.AppID, // application workflow use same app id
+				AppID:        wf.AppID, // 子工作流使用相同的应用ID
 			})
 			if err != nil {
 				return nil, err
 			}
 
+			// 5.4. 如果子工作流存在验证错误，添加到结果集合中
 			if len(issues) > 0 {
 				wfValidateInfos = append(wfValidateInfos, &cloudworkflow.ValidateTreeInfo{
 					WorkflowID: strconv.FormatInt(wf.ID, 10),
@@ -411,6 +434,7 @@ func (i *impl) ValidateTree(ctx context.Context, id int64, validateConfig vo.Val
 		}
 	}
 
+	// 6. 返回完整的验证结果（包含主工作流和所有子工作流的验证信息）
 	return wfValidateInfos, err
 }
 

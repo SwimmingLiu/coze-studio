@@ -31,7 +31,18 @@ import (
 	"github.com/coze-dev/coze-studio/backend/types/errno"
 )
 
+/**
+ * 执行工作流树结构的全面验证检查.
+ * 该方法是工作流验证的核心实现，通过多个验证步骤确保工作流的结构完整性、
+ * 逻辑正确性和配置有效性。验证采用"快速失败"策略，一旦发现问题立即返回。
+ *
+ * @param ctx 上下文对象，用于控制请求生命周期和传递元数据
+ * @param config 验证配置对象，包含画布结构、应用ID、智能体ID等验证所需信息
+ * @return 验证问题列表，如果验证通过返回空列表；验证失败时返回错误
+ * @throws ErrSerializationDeserializationFail 当画布结构反序列化失败时抛出
+ */
 func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]*validate.Issue, error) {
+	// 1. 解析画布结构数据
 	c := &vo.Canvas{}
 	err := sonic.UnmarshalString(config.CanvasSchema, &c)
 	if err != nil {
@@ -39,7 +50,10 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 			fmt.Errorf("failed to unmarshal canvas schema: %w", err))
 	}
 
+	// 2. 清理孤立节点，移除没有连接关系的无效节点和边
 	c.Nodes, c.Edges = adaptor.PruneIsolatedNodes(c.Nodes, c.Edges, nil)
+
+	// 3. 创建画布验证器实例
 	validator, err := validate.NewCanvasValidator(ctx, &validate.Config{
 		Canvas:              c,
 		AppID:               config.AppID,
@@ -51,6 +65,9 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 	}
 
 	var issues []*validate.Issue
+
+	// 4. 验证节点连接关系的有效性
+	// 检查节点之间的输入输出连接是否正确，数据类型是否匹配
 	issues, err = validator.ValidateConnections(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check connectivity : %w", err)
@@ -59,6 +76,8 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 		return issues, nil
 	}
 
+	// 5. 检测工作流中是否存在循环依赖
+	// 防止工作流执行时出现无限循环的情况
 	issues, err = validator.DetectCycles(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check loops: %w", err)
@@ -67,6 +86,8 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 		return issues, nil
 	}
 
+	// 6. 验证嵌套流程的合法性
+	// 检查批处理节点和递归节点的嵌套结构是否符合规范
 	issues, err = validator.ValidateNestedFlows(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check nested batch or recurse: %w", err)
@@ -75,6 +96,8 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 		return issues, nil
 	}
 
+	// 7. 检查引用变量的可达性和有效性
+	// 确保节点中引用的变量在执行时能够正确获取到值
 	issues, err = validator.CheckRefVariable(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check ref variable: %w", err)
@@ -83,6 +106,8 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 		return issues, nil
 	}
 
+	// 8. 验证全局变量的定义和使用
+	// 检查全局变量的声明、初始化和引用是否正确
 	issues, err = validator.CheckGlobalVariables(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check global variables: %w", err)
@@ -91,6 +116,8 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 		return issues, nil
 	}
 
+	// 9. 检查子工作流的终止计划类型配置
+	// 确保子工作流的终止策略配置正确，避免执行时的异常行为
 	issues, err = validator.CheckSubWorkFlowTerminatePlanType(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check sub workflow terminate plan type: %w", err)
@@ -99,6 +126,7 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 		return issues, nil
 	}
 
+	// 10. 所有验证步骤通过，返回空的问题列表
 	return issues, nil
 }
 

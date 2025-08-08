@@ -443,52 +443,86 @@ func assistTypeToFileType(a vo.AssistType) (vo.FileSubType, bool) {
 	}
 }
 
+/**
+ * 为NodeSchema设置输入字段的类型和来源信息.
+ * 将Canvas节点的输入参数转换为NodeSchema的输入类型和输入来源
+ *
+ * @param n Canvas节点对象
+ * @param ns 待设置的NodeSchema对象
+ * @return 转换过程中的错误信息
+ */
 func SetInputsForNodeSchema(n *vo.Node, ns *schema.NodeSchema) error {
+	// 1. 检查节点是否有输入配置
 	if n.Data.Inputs == nil {
 		return nil
 	}
 
+	// 2. 获取用户自定义的输入参数列表
 	inputParams := n.Data.Inputs.InputParameters
 	if len(inputParams) == 0 {
 		return nil
 	}
 
+	// 3. 遍历每个输入参数，进行类型转换和来源分析
 	for _, param := range inputParams {
 		name := param.Name
+
+		// 3.1 将Canvas的BlockInput转换为TypeInfo
+		// 这包括基本类型转换和复杂对象结构的解析
 		tInfo, err := CanvasBlockInputToTypeInfo(param.Input)
 		if err != nil {
 			return err
 		}
 
+		// 3.2 设置输入字段的类型信息
 		ns.SetInputType(name, tInfo)
 
+		// 3.3 分析输入字段的数据来源
+		// 确定字段值是来自静态配置、其他节点输出还是模板字符串
 		sources, err := CanvasBlockInputToFieldInfo(param.Input, einoCompose.FieldPath{name}, n.Parent())
 		if err != nil {
 			return err
 		}
 
+		// 3.4 将来源信息添加到NodeSchema中
 		ns.AddInputSource(sources...)
 	}
 
 	return nil
 }
 
+/**
+ * 为NodeSchema设置输出字段的类型信息.
+ * 将Canvas节点的输出变量转换为NodeSchema的输出类型定义
+ *
+ * @param n Canvas节点对象
+ * @param ns 待设置的NodeSchema对象
+ * @return 转换过程中的错误信息
+ */
 func SetOutputTypesForNodeSchema(n *vo.Node, ns *schema.NodeSchema) error {
+	// 1. 遍历节点定义的所有输出字段
 	for _, vAny := range n.Data.Outputs {
+		// 1.1 解析输出变量定义
 		v, err := vo.ParseVariable(vAny)
 		if err != nil {
 			return err
 		}
 
+		// 1.2 将Canvas变量转换为类型信息
 		tInfo, err := CanvasVariableToTypeInfo(v)
 		if err != nil {
 			return err
 		}
+
+		// 1.3 跳过只读的系统保留字段
+		// errorBody是异常处理时的保留输出字段，不需要用户显式定义
 		if v.ReadOnly {
 			if v.Name == "errorBody" { //  reserved output fields when exception happens
 				continue
 			}
 		}
+
+		// 1.4 设置输出字段的类型信息
 		ns.SetOutputType(v.Name, tInfo)
 	}
 

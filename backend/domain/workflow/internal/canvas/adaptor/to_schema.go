@@ -61,28 +61,47 @@ import (
 	"github.com/coze-dev/coze-studio/backend/pkg/sonic"
 )
 
+/**
+ * Canvas画布转换为工作流Schema的主入口函数.
+ * 将前端Canvas画布结构转换为后端可执行的WorkflowSchema结构
+ *
+ * @param ctx 上下文对象
+ * @param s Canvas画布对象，包含节点和边的定义
+ * @return 转换后的WorkflowSchema和可能的错误
+ */
 func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *schema.WorkflowSchema, err error) {
+	// 1. 设置panic恢复机制，确保转换过程中的异常能被捕获
 	defer func() {
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
 		}
 	}()
 
+	// 2. 移除孤立节点，只保留连通的节点和边
+	// 孤立节点是指没有连接到其他节点的节点，在工作流执行中无意义
 	connectedNodes, connectedEdges := PruneIsolatedNodes(s.Nodes, s.Edges, nil)
 	s = &vo.Canvas{
 		Nodes: connectedNodes,
 		Edges: connectedEdges,
 	}
 
+	// 3. 初始化WorkflowSchema结构
 	sc = &schema.WorkflowSchema{}
 
+	// 4. 构建节点ID到节点对象的映射表，用于后续快速查找
 	nodeMap := make(map[string]*vo.Node)
 
+	// 5. 遍历所有节点，进行逐个转换
 	for i, node := range s.Nodes {
+		// 5.1 将节点添加到映射表中
 		nodeMap[node.ID] = s.Nodes[i]
+
+		// 5.2 处理复合节点（如Loop、Batch）的子节点
 		for j, subNode := range node.Blocks {
 			nodeMap[subNode.ID] = node.Blocks[j]
-			subNode.SetParent(node)
+			subNode.SetParent(node) // 设置父子关系
+
+			// 5.3 验证嵌套结构的合法性
 			if len(subNode.Blocks) > 0 {
 				return nil, fmt.Errorf("nested inner-workflow is not supported")
 			}
@@ -91,6 +110,8 @@ func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *schema.Workf
 				return nil, fmt.Errorf("nodes in inner-workflow should not have edges info")
 			}
 
+			// 5.4 处理Break和Continue节点的特殊连接
+			// 这些节点需要连接回其父节点
 			if subNode.Type == entity.NodeTypeBreak.IDStr() || subNode.Type == entity.NodeTypeContinue.IDStr() {
 				sc.Connections = append(sc.Connections, &schema.Connection{
 					FromNode: vo.NodeKey(subNode.ID),
@@ -99,6 +120,8 @@ func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *schema.Workf
 			}
 		}
 
+		// 6. 解析批处理模式
+		// 如果节点启用了批处理，会生成新的批处理节点结构
 		newNode, enableBatch, err := parseBatchMode(node)
 		if err != nil {
 			return nil, err
@@ -106,40 +129,51 @@ func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *schema.Workf
 
 		if enableBatch {
 			node = newNode
+			// 记录生成的内部节点，用于后续处理
 			sc.GeneratedNodes = append(sc.GeneratedNodes, vo.NodeKey(node.Blocks[0].ID))
 		}
 
+		// 7. 将Canvas Node转换为NodeSchema
+		// 这是核心转换逻辑，每个节点类型都有自己的转换实现
 		nsList, hierarchy, err := NodeToNodeSchema(ctx, node, s)
 		if err != nil {
 			return nil, err
 		}
 
+		// 8. 将转换后的NodeSchema添加到工作流Schema中
 		sc.Nodes = append(sc.Nodes, nsList...)
 		if len(hierarchy) > 0 {
 			if sc.Hierarchy == nil {
 				sc.Hierarchy = make(map[vo.NodeKey]vo.NodeKey)
 			}
 
+			// 构建节点层次关系映射
 			for k, v := range hierarchy {
 				sc.Hierarchy[k] = v
 			}
 		}
 
+		// 9. 转换节点内部的连接边
 		for _, edge := range node.Edges {
 			sc.Connections = append(sc.Connections, EdgeToConnection(edge))
 		}
 	}
 
+	// 10. 转换Canvas级别的连接边
 	for _, edge := range s.Edges {
 		sc.Connections = append(sc.Connections, EdgeToConnection(edge))
 	}
 
+	// 11. 标准化端口连接
+	// 将前端的端口名称转换为后端执行引擎能理解的格式
 	newConnections, err := normalizePorts(sc.Connections, nodeMap)
 	if err != nil {
 		return nil, err
 	}
 	sc.Connections = newConnections
 
+	// 12. 构建分支信息
+	// 基于连接关系构建条件分支的执行路径
 	branches, err := schema.BuildBranches(newConnections)
 	if err != nil {
 		return nil, err
@@ -147,6 +181,7 @@ func CanvasToWorkflowSchema(ctx context.Context, s *vo.Canvas) (sc *schema.Workf
 
 	sc.Branches = branches
 
+	// 13. 初始化Schema，进行最终的验证和设置
 	sc.Init()
 
 	return sc, nil
@@ -211,60 +246,88 @@ var blockTypeToSkip = map[entity.NodeType]bool{
 	entity.NodeTypeComment: true,
 }
 
+/**
+ * 将Canvas Node转换为NodeSchema的核心函数.
+ * 根据节点类型调用相应的NodeAdaptor进行转换
+ *
+ * @param ctx 上下文对象
+ * @param n 待转换的Canvas节点
+ * @param c 完整的Canvas对象，用于获取上下文信息
+ * @return 转换后的NodeSchema列表、层次关系映射和可能的错误
+ */
 func NodeToNodeSchema(ctx context.Context, n *vo.Node, c *vo.Canvas) ([]*schema.NodeSchema, map[vo.NodeKey]vo.NodeKey, error) {
+	// 1. 将字符串类型转换为NodeType枚举
 	et := entity.IDStrToNodeType(n.Type)
 
+	// 2. 特殊处理子工作流节点
+	// 子工作流节点需要递归解析其内部的Canvas结构
 	if et == entity.NodeTypeSubWorkflow {
 		ns, err := toSubWorkflowNodeSchema(ctx, n)
 		if err != nil {
 			return nil, nil, err
 		}
+		// 设置异常处理配置
 		if ns.ExceptionConfigs, err = toExceptionConfig(n, ns.Type); err != nil {
 			return nil, nil, err
 		}
 		return []*schema.NodeSchema{ns}, nil, nil
 	}
 
+	// 3. 获取节点类型对应的适配器
+	// 每个节点类型都注册了自己的NodeAdaptor实现
 	na, ok := nodes.GetNodeAdaptor(et)
 	if ok {
+		// 4. 调用适配器的Adapt方法进行转换
+		// 这是多态设计的体现，每个节点类型有自己的转换逻辑
 		ns, err := na.Adapt(ctx, n, nodes.WithCanvas(c))
 		if err != nil {
 			return nil, nil, err
 		}
 
+		// 5. 设置通用的异常处理配置
+		// 所有节点都可能有异常处理配置，统一在这里处理
 		if ns.ExceptionConfigs, err = toExceptionConfig(n, ns.Type); err != nil {
 			return nil, nil, err
 		}
 
+		// 6. 处理复合节点的子节点
+		// 如Loop、Batch等节点包含子节点，需要递归转换
 		if len(n.Blocks) > 0 {
 			var (
-				allNS     []*schema.NodeSchema
-				hierarchy = make(map[vo.NodeKey]vo.NodeKey)
+				allNS     []*schema.NodeSchema              // 所有转换后的NodeSchema
+				hierarchy = make(map[vo.NodeKey]vo.NodeKey) // 父子关系映射
 			)
 
+			// 6.1 递归转换每个子节点
 			for _, childN := range n.Blocks {
-				childN.SetParent(n)
+				childN.SetParent(n) // 设置父子关系
 				childNS, _, err := NodeToNodeSchema(ctx, childN, c)
 				if err != nil {
 					return nil, nil, err
 				}
 
 				allNS = append(allNS, childNS...)
+				// 记录子节点与父节点的层次关系
 				hierarchy[vo.NodeKey(childN.ID)] = vo.NodeKey(n.ID)
 			}
 
+			// 6.2 将父节点也加入到结果中
 			allNS = append(allNS, ns)
 			return allNS, hierarchy, nil
 		}
 
+		// 7. 普通节点直接返回转换结果
 		return []*schema.NodeSchema{ns}, nil, nil
 	}
 
+	// 8. 检查是否为需要跳过的节点类型
+	// 某些节点类型（如注释节点）在执行时会被跳过
 	_, ok = blockTypeToSkip[et]
 	if ok {
 		return nil, nil, nil
 	}
 
+	// 9. 不支持的节点类型，返回错误
 	return nil, nil, fmt.Errorf("unsupported block type: %v", n.Type)
 }
 

@@ -1681,42 +1681,64 @@ func (w *ApplicationService) OpenAPIGetWorkflowRunHistory(ctx context.Context, r
 	return res, nil
 }
 
+/**
+ * 验证工作流树结构的有效性.
+ * 该方法用于验证工作流的画布结构是否符合规范，包括节点配置、连接关系等，
+ * 并返回验证过程中发现的所有错误信息。
+ *
+ * @param ctx 上下文对象，用于控制请求的生命周期和传递元数据
+ * @param req 工作流树验证请求，包含工作流ID、画布结构等验证所需信息
+ * @return 验证结果响应对象，包含验证错误信息列表；如果验证失败则返回错误
+ * @throws ErrWorkflowOperationFail 当工作流操作失败时抛出
+ */
 func (w *ApplicationService) ValidateTree(ctx context.Context, req *workflow.ValidateTreeRequest) (
 	_ *workflow.ValidateTreeResponse, err error,
 ) {
+	// 异常捕获和错误包装处理
 	defer func() {
+		// 1. 捕获panic异常并转换为标准错误
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
 		}
 
+		// 2. 统一包装业务错误，提供详细的错误上下文信息
 		if err != nil {
 			err = vo.WrapIfNeeded(errno.ErrWorkflowOperationFail, err, errorx.KV("cause", vo.UnwrapRootErr(err).Error()))
 		}
 	}()
 
+	// 3. 获取并验证画布结构数据
 	canvasSchema := req.GetSchema()
 	if len(canvasSchema) == 0 {
 		return nil, errors.New("validate tree schema is required")
 	}
+	// 4. 初始化响应对象
 	response := &workflow.ValidateTreeResponse{}
 
+	// 5. 构建验证配置对象
 	validateTreeCfg := vo.ValidateTreeConfig{
 		CanvasSchema: canvasSchema,
 	}
+	// 6. 处理可选的项目绑定ID参数
 	if req.GetBindProjectID() != "" {
+		// 6.1. 将字符串类型的项目ID转换为int64类型
 		pId, err := strconv.ParseInt(req.GetBindProjectID(), 10, 64)
 		if err != nil {
 			return nil, err
 		}
+		// 6.2. 设置应用ID到验证配置中
 		validateTreeCfg.AppID = ptr.Of(pId)
 	}
 
+	// 7. 调用领域服务层执行具体的工作流树验证逻辑
 	wfValidateInfos, err := GetWorkflowDomainSVC().ValidateTree(ctx, mustParseInt64(req.GetWorkflowID()), validateTreeCfg)
 	if err != nil {
 		return nil, err
 	}
+	// 8. 设置验证结果数据到响应对象
 	response.Data = wfValidateInfos
 
+	// 9. 返回验证结果
 	return response, nil
 }
 
