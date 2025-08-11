@@ -37,8 +37,24 @@ import (
 	"github.com/coze-dev/coze-studio/backend/types/errno"
 )
 
+/**
+ * 设置根工作流执行成功状态并发送最终消息
+ *
+ * 在异步执行模式下，工作流成功事件和Exit节点完成事件可能会乱序到达。
+ * 为了保证状态一致性和对外可见顺序，本函数实现了以下机制：
+ * 1. 在HandleExecuteEvent中缓存workflowSuccess信号
+ * 2. 等待lastNodeDone信号再统一触发数据库更新和消息推送
+ * 3. 确保前端接收到的状态变更是有序且完整的
+ *
+ * @param ctx 上下文对象，用于传递请求相关信息和控制执行生命周期
+ * @param event 工作流成功事件，包含执行结果、耗时、Token使用情况等信息
+ * @param repo 工作流仓储接口，负责数据持久化操作
+ * @param sw 流式消息写入器，用于向订阅方推送状态消息（可为nil）
+ * @return error 操作过程中的错误信息，成功时返回nil
+ */
 func setRootWorkflowSuccess(ctx context.Context, event *Event, repo workflow.Repository,
 	sw *schema.StreamWriter[*entity.Message]) (err error) {
+	// 步骤1: 提取执行ID并构建工作流执行成功的数据结构
 	exeID := event.RootCtx.RootExecuteID
 	wfExec := &entity.WorkflowExecution{
 		ID:       exeID,
@@ -51,6 +67,8 @@ func setRootWorkflowSuccess(ctx context.Context, event *Event, repo workflow.Rep
 		},
 	}
 
+	// 步骤2: 更新数据库中的工作流执行状态为成功
+	// 使用乐观锁机制，只有当前状态为Running时才允许更新为Success
 	var (
 		updatedRows   int64
 		currentStatus entity.WorkflowExecuteStatus
@@ -61,6 +79,7 @@ func setRootWorkflowSuccess(ctx context.Context, event *Event, repo workflow.Rep
 		return fmt.Errorf("failed to update workflow execution to success for execution id %d, current status is %v", exeID, currentStatus)
 	}
 
+	// 步骤3: 如果是调试模式，更新工作流草稿测试运行状态
 	rootWkID := event.RootWorkflowBasic.ID
 	exeCfg := event.ExeCfg
 	if exeCfg.Mode == vo.ExecuteModeDebug {
@@ -69,6 +88,8 @@ func setRootWorkflowSuccess(ctx context.Context, event *Event, repo workflow.Rep
 		}
 	}
 
+	// 步骤4: 通过StreamWriter向订阅方发送最终成功状态消息
+	// 这确保了前端能够及时收到工作流完成的通知
 	if sw != nil {
 		sw.Send(&entity.Message{
 			StateMessage: &entity.StateMessage{
@@ -94,9 +115,34 @@ const (
 	lastNodeDone    terminateSignal = "lastNodeDone"
 )
 
+/**
+ * 工作流事件处理核心调度器
+ *
+ * 本函数是异步工作流执行的事件处理核心，负责将各种执行态事件（节点/工作流/工具流）
+ * 映射到具体的持久化操作、SSE消息推送和状态机迁移。
+ *
+ * 核心职责：
+ * 1. 事件分发：根据事件类型分发到对应的处理逻辑
+ * 2. 状态管理：维护工作流和节点的执行状态
+ * 3. 消息推送：通过StreamWriter向前端推送实时消息
+ * 4. 背压控制：采用"增量传输+就近落库"策略防止内存堆积
+ * 5. 终止信号：通过terminateSignal控制主事件循环的生命周期
+ *
+ * @param ctx 上下文对象，用于传递请求相关信息和控制执行生命周期
+ * @param event 待处理的执行事件，包含事件类型、执行上下文、输入输出等信息
+ * @param repo 工作流仓储接口，负责数据持久化操作
+ * @param sw 流式消息写入器，当上游需要中间态推送时不为nil
+ * @return signal 终止信号，指示主事件循环是否应该终止以及终止原因
+ * @return error 事件处理过程中的错误信息，成功时返回nil
+ */
 func handleEvent(ctx context.Context, event *Event, repo workflow.Repository,
-	sw *schema.StreamWriter[*entity.Message], // when this workflow's caller needs to receive intermediate results
+	sw *schema.StreamWriter[*entity.Message], // 上游需要中间态推送时不为 nil
 ) (signal terminateSignal, err error) {
+	// 事件消费端：将“执行期事件”映射为“持久化 + SSE 推送 + 状态机迁移”。
+	// 背压策略：
+	// - 对节点流式输出(NodeStreamingOutput)与工具流式(ToolStreamingResponse)，只发送增量片段；
+	// - 对 Exit/Emitter 等直出节点，优先发送上一帧，末帧标记 StreamEnd，降低小帧堆积与网络抖动；
+	// - 中断(WorkflowInterrupt)采用阻塞确认(event.done)，保证“落库完成再返回”。
 	switch event.Type {
 	case WorkflowStart:
 		exeID := event.RootCtx.RootExecuteID
@@ -259,6 +305,11 @@ func handleEvent(ctx context.Context, event *Event, repo workflow.Repository,
 			return workflowAbort, nil
 		}
 	case WorkflowInterrupt:
+		// 中断事件为异步交互的核心：
+		// 1) 标记执行状态为 Interrupted，允许外部 Resume；
+		// 2) 将 flatten 后的中断事件列表可靠落库；
+		// 3) 若为根工作流，立刻向订阅方推送“可恢复提示”与状态，降低重试/阻塞风险；
+		// 4) 通过 event.done 与回调协作，确保“落库完成”后再返回，避免竞态与重复。
 		if event.done != nil {
 			defer close(event.done)
 		}
@@ -440,6 +491,10 @@ func handleEvent(ctx context.Context, event *Event, repo workflow.Repository,
 			return noTerminate, fmt.Errorf("failed to create node execution: %v", err)
 		}
 	case NodeEnd, NodeEndStreaming:
+		// 节点成功（包含流式完成）：
+		// - 优先 UpdateNodeExecution(…Streaming) 增量写库，
+		// - 对 OutputEmitter/Exit(UseAnswerContent) 产生的可读 Answer，
+		//   仅传递增量文本，避免反复序列化全量结构导致事件堆积与下游压力。
 		nodeExec := &entity.NodeExecution{
 			ID:       event.NodeExecuteID,
 			Status:   entity.NodeSuccess,
@@ -571,25 +626,36 @@ func handleEvent(ctx context.Context, event *Event, repo workflow.Repository,
 			return lastNodeDone, nil
 		}
 	case NodeStreamingOutput:
+		// 处理节点流式输出事件：实现增量传输和实时推送的核心逻辑
+
+		// 步骤1: 构建节点执行数据结构，准备增量输出数据
+		// 流式增量策略：只发送本次增量与Answer文本，Last标志由StreamEnd标记
 		nodeExec := &entity.NodeExecution{
 			ID:    event.NodeExecuteID,
 			Extra: event.extra,
 		}
 
+		// 步骤2: 提取或序列化节点输出数据
+		// 支持自定义输出提取器，用于精简数据结构或格式转换
 		if event.outputExtractor != nil {
 			nodeExec.Output = ptr.Of(event.outputExtractor(event.Output))
 		} else {
 			nodeExec.Output = ptr.Of(mustMarshalToString(event.Output))
 		}
 
+		// 步骤3: 将增量输出数据保存到Redis缓存
+		// 使用流式更新机制，避免频繁的数据库写入操作
 		if err = repo.UpdateNodeExecutionStreaming(ctx, nodeExec); err != nil {
 			return noTerminate, fmt.Errorf("failed to save node execution: %v", err)
 		}
 
+		// 步骤4: 检查是否需要向前端推送流式消息
 		if sw == nil {
 			return noTerminate, nil
 		}
 
+		// 步骤5: 过滤不需要推送流式消息的节点类型
+		// Exit节点在子工作流中不推送消息，VariableAggregator节点不推送流式消息
 		if event.NodeType == entity.NodeTypeExit {
 			if event.Context.SubWorkflowCtx != nil {
 				return noTerminate, nil
@@ -598,16 +664,18 @@ func handleEvent(ctx context.Context, event *Event, repo workflow.Repository,
 			return noTerminate, nil
 		}
 
+		// 步骤6: 向前端推送增量数据消息
+		// 采用"上一帧优先发送、当前帧留作上一帧"的策略，降低网络抖动影响
 		sw.Send(&entity.Message{
 			DataMessage: &entity.DataMessage{
 				ExecuteID: event.RootExecuteID,
 				Role:      schema.Assistant,
 				Type:      entity.Answer,
-				Content:   event.Answer,
+				Content:   event.Answer, // 本次增量内容
 				NodeID:    string(event.NodeKey),
 				NodeType:  event.NodeType,
 				NodeTitle: event.NodeName,
-				Last:      event.StreamEnd,
+				Last:      event.StreamEnd, // 标记是否为流式输出的最后一帧
 			},
 		}, nil)
 	case NodeStreamingInput:
@@ -689,6 +757,8 @@ func handleEvent(ctx context.Context, event *Event, repo workflow.Repository,
 			},
 		}, nil)
 	case ToolStreamingResponse:
+		// 工具流式输出：全链路只携带增量 Response，并在 EOF 时发送 Last 帧，
+		// 防止在服务端/客户端侧累计大量碎片消息。
 		cacheToolStreamingResponse(ctx, event)
 		if sw == nil {
 			return noTerminate, nil

@@ -76,6 +76,9 @@ type ToolHandler struct {
 func NewRootWorkflowHandler(wb *entity.WorkflowBasic, executeID int64, requireCheckpoint bool,
 	ch chan<- *Event, resumedEvent *entity.InterruptEvent, exeCfg vo.ExecuteConfig, nodeCount int32,
 ) callbacks.Handler {
+	// 异步执行主入口：
+	// - ch: 事件下行通道（与 HandleExecuteEvent 主循环解耦）
+	// - requireCheckpoint: 是否需要记录断点，用于中断恢复/并行冲突时的幂等
 	return &WorkflowHandler{
 		ch:                ch,
 		rootWorkflowBasic: wb,
@@ -217,7 +220,7 @@ func (w *WorkflowHandler) OnStart(ctx context.Context, info *callbacks.RunInfo, 
 		return ctx
 	}
 
-	newCtx, resumed := w.initWorkflowCtx(ctx)
+	newCtx, resumed := w.initWorkflowCtx(ctx) // 可能从断点恢复（ResumeEvent）复用已有上下文
 
 	if w.subWorkflowBasic == nil {
 		// check if already canceled
@@ -268,7 +271,7 @@ func (w *WorkflowHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, ou
 		Duration:  time.Since(time.UnixMilli(c.StartTime)),
 	}
 
-	if c.TokenCollector != nil {
+	if c.TokenCollector != nil { // 等待所有子 collector 归并后再结算 usage，避免重复累计
 		usage := c.TokenCollector.wait()
 		e.Token = &TokenInfo{
 			InputToken:  int64(usage.PromptTokens),
@@ -277,7 +280,7 @@ func (w *WorkflowHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, ou
 		}
 	}
 
-	w.ch <- e
+	w.ch <- e // 事件异步投递：由 HandleExecuteEvent 统一落库与推送
 
 	return ctx
 }
@@ -352,7 +355,7 @@ func (w *WorkflowHandler) OnError(ctx context.Context, info *callbacks.RunInfo, 
 
 	c := GetExeCtx(ctx)
 
-	interruptInfo, ok := compose.ExtractInterruptInfo(err)
+	interruptInfo, ok := compose.ExtractInterruptInfo(err) // 中断分支：不是致命错误，落库可恢复事件，等待 resume
 	if ok {
 		if w.subWorkflowBasic != nil {
 			return ctx
@@ -369,21 +372,21 @@ func (w *WorkflowHandler) OnError(ctx context.Context, info *callbacks.RunInfo, 
 				interruptEvent.EventType, interruptEvent.NodeKey)
 		}
 
-		done := make(chan struct{})
+		done := make(chan struct{}) // 用于阻塞直到落库完成，防止并发下重复保存/错乱顺序
 
-		w.ch <- &Event{
+		w.ch <- &Event{ // 发出“中断事件”：主循环落库后通过 done 通知释放
 			Type:            WorkflowInterrupt,
 			Context:         c,
 			InterruptEvents: interruptEvents,
 			done:            done,
 		}
 
-		<-done
+		<-done // 等待持久化完成后再返回（保证顺序性）
 
 		return ctx
 	}
 
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) { // 取消分支：触发 Cancel 事件，写库并透传至上层
 		e := &Event{
 			Type:     WorkflowCancel,
 			Context:  c,
@@ -404,7 +407,7 @@ func (w *WorkflowHandler) OnError(ctx context.Context, info *callbacks.RunInfo, 
 
 	logs.CtxErrorf(ctx, "workflow failed: %v", err)
 
-	e := &Event{
+	e := &Event{ // 失败分支：标准化错误，落库并通知上游
 		Type:     WorkflowFailed,
 		Context:  c,
 		Duration: time.Since(time.UnixMilli(c.StartTime)),
@@ -629,7 +632,7 @@ func (n *NodeHandler) OnStart(ctx context.Context, info *callbacks.RunInfo, inpu
 		return ctx
 	}
 
-	newCtx, resumed := n.initNodeCtx(ctx, entity.NodeType(info.Type))
+	newCtx, resumed := n.initNodeCtx(ctx, entity.NodeType(info.Type)) // 节点级 Resume，复用断点上下文
 
 	if resumed {
 		return newCtx
@@ -698,7 +701,7 @@ func (n *NodeHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, output
 		extra:     &entity.NodeExtra{},
 	}
 
-	if c.TokenCollector != nil && entity.NodeMetaByNodeType(c.NodeType).MayUseChatModel {
+	if c.TokenCollector != nil && entity.NodeMetaByNodeType(c.NodeType).MayUseChatModel { // 仅对可能产出 tokens 的节点等待归并
 		usage := c.TokenCollector.wait()
 		e.Token = &TokenInfo{
 			InputToken:  int64(usage.PromptTokens),
@@ -707,7 +710,7 @@ func (n *NodeHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, output
 		}
 	}
 
-	if c.NodeType == entity.NodeTypeOutputEmitter {
+	if c.NodeType == entity.NodeTypeOutputEmitter { // 直出文本类节点：抽取 Answer 作为增量
 		e.Answer = output.(map[string]any)["output"].(string)
 	} else if c.NodeType == entity.NodeTypeExit && *c.TerminatePlan == vo.UseAnswerContent {
 		e.Answer = output.(map[string]any)["output"].(string)
@@ -735,7 +738,7 @@ func (n *NodeHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, output
 		if terminatePlan == nil {
 			terminatePlan = ptr.Of(vo.ReturnVariables)
 		}
-		if *terminatePlan == vo.UseAnswerContent {
+		if *terminatePlan == vo.UseAnswerContent { // Exit 使用答案直出：设置 terminal_plan 并精简输出序列化
 			e.extra = &entity.NodeExtra{
 				ResponseExtra: map[string]any{
 					"terminal_plan": workflow2.TerminatePlanType_USESETTING,
@@ -762,7 +765,7 @@ func (n *NodeHandler) OnEnd(ctx context.Context, info *callbacks.RunInfo, output
 	default:
 	}
 
-	n.ch <- e
+	n.ch <- e // 事件异步下发，主循环负责写库与下游推送
 
 	return ctx
 }
@@ -774,7 +777,7 @@ func (n *NodeHandler) OnError(ctx context.Context, info *callbacks.RunInfo, err 
 
 	c := GetExeCtx(ctx)
 
-	if _, ok := compose.IsInterruptRerunError(err); ok { // current node interrupts
+	if _, ok := compose.IsInterruptRerunError(err); ok { // 当前节点触发中断：保存 NodeCtx 以便精准恢复
 		if err := compose.ProcessState[ExeContextStore](ctx, func(ctx context.Context, state ExeContextStore) error {
 			if state == nil {
 				return errors.New("state is nil")
@@ -794,7 +797,7 @@ func (n *NodeHandler) OnError(ctx context.Context, info *callbacks.RunInfo, err 
 			return ctx
 		}
 
-		e := &Event{
+		e := &Event{ // 普通失败：归并 Token、写库、通知
 			Type:     NodeError,
 			Context:  c,
 			Duration: time.Since(time.UnixMilli(c.StartTime)),
@@ -878,9 +881,9 @@ func (n *NodeHandler) OnStartWithStreamInput(ctx context.Context, info *callback
 			}
 		}
 	}
-	n.ch <- e
+	n.ch <- e // 提前下发 NodeStart，随后在 goroutine 中消费流入输入并增量上报
 
-	safego.Go(ctx, func() {
+	safego.Go(ctx, func() { // 异步消费输入流，逐块合并并按需上报增量，避免堆积在单处
 		defer input.Close()
 		fullInput := make(map[string]any)
 		var previous map[string]any
@@ -935,7 +938,7 @@ func (n *NodeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks
 	c := GetExeCtx(ctx)
 
 	switch t := entity.NodeType(info.Type); t {
-	case entity.NodeTypeLLM:
+	case entity.NodeTypeLLM: // LLM 流式：聚合结构化增量，定期发送 NodeStreamingOutput，最后发送 NodeEndStreaming
 		safego.Go(ctx, func() {
 			defer output.Close()
 			fullOutput := make(map[string]any)
@@ -1026,7 +1029,7 @@ func (n *NodeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks
 
 			n.ch <- e
 		})
-	case entity.NodeTypeVariableAggregator:
+	case entity.NodeTypeVariableAggregator: // 聚合器：仅当增量有变化时发送，减少无效帧
 		safego.Go(ctx, func() {
 			defer output.Close()
 
@@ -1108,7 +1111,7 @@ func (n *NodeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks
 
 			n.ch <- e
 		})
-	case entity.NodeTypeExit, entity.NodeTypeOutputEmitter, entity.NodeTypeSubWorkflow:
+	case entity.NodeTypeExit, entity.NodeTypeOutputEmitter, entity.NodeTypeSubWorkflow: // 直出文本/Exit/子流程：采用“前一帧先行发送”去抖
 		consumer := func(ctx context.Context) context.Context {
 			defer output.Close()
 			fullOutput := make(map[string]any)
@@ -1128,7 +1131,7 @@ func (n *NodeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks
 									n.ch <- previousEvent
 								}
 							} else {
-								if secondPreviousEvent != nil {
+								if secondPreviousEvent != nil { // 前一帧优先发送，降低小帧堆积与前端抖动
 									n.ch <- secondPreviousEvent
 								}
 
@@ -1208,7 +1211,7 @@ func (n *NodeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks
 				extra:     &entity.NodeExtra{},
 			}
 
-			if answer, ok := fullOutput["output"]; ok {
+			if answer, ok := fullOutput["output"]; ok { // 最后抽取 Answer，便于 SSE 终帧直出
 				if entity.NodeType(info.Type) == entity.NodeTypeOutputEmitter {
 					e.Answer = answer.(string)
 					e.outputExtractor = func(o map[string]any) string {
@@ -1253,7 +1256,7 @@ func (n *NodeHandler) OnEndWithStreamOutput(ctx context.Context, info *callbacks
 			return ctx
 		}
 
-		if c.NodeType == entity.NodeTypeExit {
+		if c.NodeType == entity.NodeTypeExit { // Exit 采用 goroutine，保证工具快速直返时的“打字机”体验不被阻塞
 			go consumer(ctx) // handles Exit node asynchronously to keep the typewriter effect for workflow tool returning directly
 			return ctx
 		} else if c.NodeType == entity.NodeTypeOutputEmitter || c.NodeType == entity.NodeTypeSubWorkflow {

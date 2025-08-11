@@ -149,6 +149,7 @@ func GetAdaptOptions(opts ...AdaptOption) *AdaptOptions {
 }
 
 // NodeAdaptor provides conversion from frontend Node to backend NodeSchema.
+// 注：执行期的异步/流式行为由 execute 层回调与事件管道负责，本层仅提供结构适配。
 type NodeAdaptor interface {
 	Adapt(ctx context.Context, n *vo.Node, opts ...AdaptOption) (
 		*schema.NodeSchema, error)

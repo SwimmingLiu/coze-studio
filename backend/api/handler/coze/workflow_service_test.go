@@ -891,6 +891,8 @@ func getCanvas(ctx context.Context, id string) (string, error) {
 
 }
 
+// openapiStream 发起 /v1/workflow/stream_run 请求，并返回 SSE reader
+// 测试流式路径时，Reader 将被逐事件消费，避免缓冲层数据堆积影响断言时序。
 func (r *wfTestRunner) openapiStream(id string, input any) *sse.Reader {
 	inputStr, _ := sonic.MarshalString(input)
 
@@ -921,6 +923,8 @@ func (r *wfTestRunner) openapiStream(id string, input any) *sse.Reader {
 	return re
 }
 
+// openapiResume 发起 /v1/workflow/stream_resume 请求（中断恢复）
+// 用于验证 Interrupt→Resume 闭环以及消息时序的稳定性。
 func (r *wfTestRunner) openapiResume(id string, eventID string, resumeData string) *sse.Reader {
 	req := &workflow.OpenAPIStreamResumeFlowRequest{
 		WorkflowID:  id,

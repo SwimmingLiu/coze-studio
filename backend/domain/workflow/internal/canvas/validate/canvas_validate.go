@@ -816,30 +816,44 @@ func toTerminatePlan(p int) string {
 	}
 }
 
+// detectCycles 使用深度优先搜索(DFS)在“反向控制流图”上检测环。
+// 参数说明：
+//   - nodes: 画布中全部节点 ID 列表
+//   - controlSuccessors: 反向邻接表，键为 target(被指向节点)，值为其所有 source(指向它的前驱)集合 HashMap
+//
+// 返回值：
+//   - 所有检测到的环路，每个环以节点序列表示，最后一个元素与环的起点相同以形成闭环
+//
+// 算法要点：
+//   - 以未访问的节点为起点启动 DFS，使用 visited 作为全局访问标记，避免从同一节点重复作为根启动
+//   - 在当前递归路径 path 中，若发现后继已存在于 path，说明形成“回边(Back Edge)”，则截取环并记录
 func detectCycles(nodes []string, controlSuccessors map[string][]string) [][]string {
-	visited := map[string]bool{}
+	visited := map[string]bool{} // 全局访问标记：被任一 DFS 触达过的节点将不再作为外层起点
 	var dfs func(path []string) [][]string
 	dfs = func(path []string) [][]string {
 		var ret [][]string
-		pathEnd := path[len(path)-1]
+		pathEnd := path[len(path)-1] // 当前递归路径的末尾节点
 		successors, ok := controlSuccessors[pathEnd]
 		if !ok {
-			return nil
+			return nil // 没有可继续的边，结束该分支
 		}
 		for _, successor := range successors {
-			visited[successor] = true
+			visited[successor] = true // 标记为已触达，外层不再从该点重复启动 DFS // ← 全局去重
 			var looped bool
+			// 检查是否存在回到当前路径中某个节点的情况
 			for i, node := range path {
 				if node == successor {
-					ret = append(ret, append(path[i:], successor))
+					// 发现环：从 path[i:] 到 successor 形成闭环
+					ret = append(ret, append(path[i:], successor)) // ← 关键：截取环并闭合
 					looped = true
 					break
 				}
 			}
 			if looped {
-				continue
+				continue // 已记录该环，避免继续深入造成重复
 			}
 
+			// 未成环则继续向下深搜
 			ret = append(ret, dfs(append(path, successor))...)
 		}
 		return ret
@@ -848,6 +862,7 @@ func detectCycles(nodes []string, controlSuccessors map[string][]string) [][]str
 	var ret [][]string
 	for _, node := range nodes {
 		if !visited[node] {
+			// 从尚未被任何 DFS 触达的节点作为根启动一次 DFS // ← 启动点
 			ret = append(ret, dfs([]string{node})...)
 		}
 	}

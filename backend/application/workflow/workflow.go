@@ -536,9 +536,20 @@ func (w *ApplicationService) NodeDebug(ctx context.Context, req *workflow.Workfl
 	}, nil
 }
 
+/**
+ * 获取工作流执行过程详情.
+ * 该方法用于查询工作流的执行状态、节点执行结果、Token消耗情况以及中断事件等详细信息，
+ * 主要为前端轮询提供实时的工作流执行进度数据。
+ *
+ * @param ctx 上下文对象，包含请求的元信息和用户身份信息
+ * @param req 获取工作流执行过程的请求参数，包含工作流ID、执行ID等信息
+ * @return 工作流执行过程响应对象，包含执行状态、节点结果、Token消耗等详细信息
+ * @throws ErrWorkflowOperationFail 当工作流操作失败时抛出此异常
+ */
 func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWorkflowProcessRequest) (
 	_ *workflow.GetWorkflowProcessResponse, err error,
 ) {
+	// 统一异常处理和错误包装
 	defer func() {
 		if panicErr := recover(); panicErr != nil {
 			err = safego.NewPanicErr(panicErr, debug.Stack())
@@ -549,17 +560,21 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		}
 	}()
 
+	// 1. 验证用户空间权限
 	if err := checkUserSpace(ctx, ctxutil.MustGetUIDFromCtx(ctx), mustParseInt64(req.GetSpaceID())); err != nil {
 		return nil, err
 	}
 
+	// 2. 构建工作流执行实体查询条件
 	var wfExeEntity *entity.WorkflowExecution
 	if req.SubExecuteID == nil {
+		// 2.1. 查询主工作流执行记录
 		wfExeEntity = &entity.WorkflowExecution{
 			ID:         mustParseInt64(req.GetExecuteID()),
 			WorkflowID: mustParseInt64(req.GetWorkflowID()),
 		}
 	} else {
+		// 2.2. 查询子工作流执行记录
 		wfExeEntity = &entity.WorkflowExecution{
 			ID:              mustParseInt64(req.GetSubExecuteID()),
 			WorkflowID:      mustParseInt64(req.GetWorkflowID()),
@@ -567,16 +582,19 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		}
 	}
 
+	// 3. 从数据库获取工作流执行详情（包含节点执行信息）
 	wfExeEntity, err = GetWorkflowDomainSVC().GetExecution(ctx, wfExeEntity, true)
 	if err != nil {
 		return nil, err
 	}
 
+	// 4. 处理工作流状态（将中断状态转换为运行状态）
 	status := wfExeEntity.Status
 	if status == entity.WorkflowInterrupted {
 		status = entity.WorkflowRunning
 	}
 
+	// 5. 构建基础响应数据结构
 	resp := &workflow.GetWorkflowProcessResponse{
 		Data: &workflow.GetWorkFlowProcessData{
 			WorkFlowId:       fmt.Sprintf("%d", wfExeEntity.WorkflowID),
@@ -590,6 +608,7 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		},
 	}
 
+	// 6. 填充Token消耗信息
 	if wfExeEntity.TokenInfo != nil {
 		resp.Data.TokenAndCost = &workflow.TokenAndCost{
 			InputTokens:  ptr.Of(fmt.Sprintf("%d Tokens", wfExeEntity.TokenInfo.InputTokens)),
@@ -598,35 +617,50 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		}
 	}
 
+	// 7. 填充项目ID信息
 	if wfExeEntity.AppID != nil {
 		resp.Data.ProjectId = fmt.Sprintf("%d", *wfExeEntity.AppID)
 	}
 
+	// 8. 初始化节点处理相关变量
 	var (
-		hasNodeErr   bool
+		// 是否存在节点错误
+		hasNodeErr bool
+		// 工作流是否失败
 		workflowFail = status == entity.WorkflowFailed
-		endNodeExe   *workflow.NodeResult
+		// 结束节点执行结果
+		endNodeExe *workflow.NodeResult
 	)
 
+	// 批处理节点结果映射表
 	batchNodeID2NodeResult := make(map[string]*workflow.NodeResult)
+	// 批处理内部节点结果映射表
 	batchNodeID2InnerNodeResult := make(map[string]*workflow.NodeResult)
+	// 成功节点数量统计
 	successNum := 0
+
+	// 9. 遍历处理所有节点执行结果
 	for _, nodeExe := range wfExeEntity.NodeExecutions {
+		// 9.1. 检查节点是否存在错误
 		if nodeExe.Status == entity.NodeFailed && nodeExe.ErrorInfo != nil {
 			hasNodeErr = true
 		}
 
+		// 9.2. 转换节点执行记录为响应格式
 		nr, err := convertNodeExecution(nodeExe)
 		if err != nil {
 			return nil, err
 		}
 
+		// 9.3. 标记结束节点
 		if nodeExe.NodeType == entity.NodeTypeExit {
 			endNodeExe = nr
 		}
 
+		// 9.4. 处理批处理节点的特殊逻辑
 		if nodeExe.NodeType == entity.NodeTypeBatch {
 			if inner, ok := batchNodeID2InnerNodeResult[nodeExe.NodeID]; ok {
+				// 合并批处理模式的节点结果
 				nr = mergeBatchModeNodes(inner, nr)
 				delete(batchNodeID2InnerNodeResult, nodeExe.NodeID)
 			} else {
@@ -634,6 +668,7 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 				continue
 			}
 		} else if len(nodeExe.IndexedExecutions) > 0 {
+			// 9.5. 处理批处理模式下生成的子节点
 			if vo.IsGeneratedNodeForBatchMode(nodeExe.NodeID, *nodeExe.ParentNodeID) {
 				parentNodeResult, ok := batchNodeID2NodeResult[*nodeExe.ParentNodeID]
 				if ok {
@@ -646,27 +681,32 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 			}
 		}
 
+		// 9.6. 统计成功节点数量
 		if nr.NodeStatus == workflow.NodeExeStatus_Success {
 			successNum++
 		}
 
+		// 9.7. 添加节点结果到响应数据
 		resp.Data.NodeResults = append(resp.Data.NodeResults, nr)
 	}
 
+	// 10. 处理工作流失败但没有节点错误的情况
 	if workflowFail && !hasNodeErr {
 		var failReason string
 		if wfExeEntity.FailReason != nil {
 			failReason = *wfExeEntity.FailReason
 			if endNodeExe != nil {
+				// 10.1. 为现有结束节点添加错误信息
 				endNodeExe.ErrorInfo = failReason
 				endNodeExe.ErrorLevel = string(vo.LevelError)
 			} else {
 				if len(resp.Data.NodeResults) == 1 &&
 					(resp.Data.NodeResults)[0].NodeType != workflow.NodeTemplateType_Start.String() {
-					// this is single node debug
+					// 10.2. 单节点调试场景，直接为该节点添加错误信息
 					resp.Data.NodeResults[0].ErrorInfo = failReason
 					resp.Data.NodeResults[0].ErrorLevel = string(vo.LevelError)
 				} else {
+					// 10.3. 创建新的结束节点来承载错误信息
 					endNodeExe = &workflow.NodeResult{
 						NodeId:     entity.ExitNodeKey,
 						NodeType:   workflow.NodeTemplateType_End.String(),
@@ -680,6 +720,7 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		}
 	}
 
+	// 11. 处理剩余的批处理节点结果
 	for id := range batchNodeID2NodeResult {
 		nr := batchNodeID2NodeResult[id]
 		if nr.NodeStatus == workflow.NodeExeStatus_Success {
@@ -688,11 +729,14 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		resp.Data.NodeResults = append(resp.Data.NodeResults, nr)
 	}
 
+	// 12. 计算工作流执行成功率
 	if wfExeEntity.NodeCount > 0 {
 		resp.Data.Rate = fmt.Sprintf("%.2f", float64(successNum)/float64(wfExeEntity.NodeCount))
 	}
 
+	// 13. 处理中断事件信息
 	for _, ie := range wfExeEntity.InterruptEvents {
+		// 13.1. 特殊处理LLM中断事件
 		if ie.EventType == entity.InterruptEventLLM {
 			ie = &entity.InterruptEvent{
 				ID:            ie.ID,
@@ -705,6 +749,7 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 			}
 		}
 
+		// 13.2. 构建节点事件响应数据
 		resp.Data.NodeEvents = append(resp.Data.NodeEvents, &workflow.NodeEvent{
 			ID:           strconv.FormatInt(ie.ID, 10),
 			NodeID:       string(ie.NodeKey),
@@ -716,6 +761,7 @@ func (w *ApplicationService) GetProcess(ctx context.Context, req *workflow.GetWo
 		})
 	}
 
+	// 14. 返回完整的工作流执行过程响应
 	return resp, nil
 }
 
@@ -1224,6 +1270,16 @@ const (
 	InterruptEvent StreamRunEventType = "interrupt"
 )
 
+/**
+ * 将领域层的流式消息转换为 OpenAPI 层的流式响应事件.
+ *
+ * 设计要点：
+ * 1. 输入为领域层的统一消息体 entity.Message，可能包含状态类(StateMessage)或数据类(DataMessage)。
+ * 2. 根据不同的工作流状态转换为前端可识别的事件类型：Done/Message/Error/Interrupt。
+ * 3. 跳过来自工具节点的非最终回答类消息，保证流式数据干净（仅对 Answer 输出透传）。
+ * 4. 保持执行上下文的一致性（executeID/spaceID），并按节点维度维护递增的序列号(node_seq_id)。
+ * 5. 每次成功转换都会自增 messageID，用于 SSE 事件的 id 字段。
+ */
 func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *workflow.OpenAPIStreamRunFlowResponse, err error) {
 	var (
 		messageID  int
@@ -1233,12 +1289,14 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 	)
 
 	return func(msg *entity.Message) (res *workflow.OpenAPIStreamRunFlowResponse, err error) {
+		// 1. 统一的自增消息编号，保证 SSE 事件顺序可追踪
 		defer func() {
 			if err == nil {
 				messageID++
 			}
 		}()
 
+		// 2. 处理状态类消息：依据工作流状态映射到 Done/Error/Interrupt 事件
 		if msg.StateMessage != nil {
 			// stream run will skip all messages from workflow tools
 			if executeID > 0 && executeID != msg.StateMessage.ExecuteID {
@@ -1247,12 +1305,14 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 
 			switch msg.StateMessage.Status {
 			case entity.WorkflowSuccess:
+				// 2.1 执行成功，发送 Done 事件并附带 DebugUrl
 				return &workflow.OpenAPIStreamRunFlowResponse{
 					ID:       strconv.Itoa(messageID),
 					Event:    string(DoneEvent),
 					DebugUrl: ptr.Of(fmt.Sprintf(vo.DebugURLTpl, executeID, spaceID, workflowID)),
 				}, nil
 			case entity.WorkflowFailed, entity.WorkflowCancel:
+				// 2.2 执行失败或取消，转换为错误事件，携带错误码与错误信息
 				var wfe vo.WorkflowError
 				if !errors.As(msg.StateMessage.LastError, &wfe) {
 					panic("stream run last error is not a WorkflowError")
@@ -1265,6 +1325,7 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 					ErrorMessage: ptr.Of(wfe.Msg()),
 				}, nil
 			case entity.WorkflowInterrupted:
+				// 2.3 执行被中断（可能来自人工输入/工具交互），构造 Interrupt 事件并返回恢复所需的 event_id
 				if msg.InterruptEvent.ToolInterruptEvent == nil {
 					return &workflow.OpenAPIStreamRunFlowResponse{
 						ID:       strconv.Itoa(messageID),
@@ -1289,6 +1350,7 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 					},
 				}, nil
 			case entity.WorkflowRunning:
+				// 2.4 执行中状态，更新上下文并跳过输出
 				executeID = msg.StateMessage.ExecuteID
 				spaceID = msg.SpaceID
 				return nil, schema.ErrNoValue
@@ -1297,6 +1359,7 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 			}
 		}
 
+		// 3. 处理数据类消息：仅透传最终回答(Answer)类输出
 		if msg.DataMessage != nil {
 			if msg.Type != entity.Answer {
 				// stream run api do not emit FunctionCall or ToolResponse
@@ -1319,11 +1382,13 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 				NodeID:       ptr.Of(msg.NodeID),
 			}
 
+			// 3.1 透出 Token 用量（若存在）
 			if msg.DataMessage.Usage != nil {
 				token := msg.DataMessage.Usage.InputTokens + msg.DataMessage.Usage.OutputTokens
 				res.Token = ptr.Of(token)
 			}
 
+			// 3.2 维护节点级别有序编号，便于前端对同一节点的消息聚合与排序
 			seq, ok := nodeID2Seq[msg.NodeID]
 			if !ok {
 				seq = 0
@@ -1338,6 +1403,16 @@ func convertStreamRunEvent(workflowID int64) func(msg *entity.Message) (res *wor
 	}
 }
 
+/**
+ * 执行已发布的工作流（流式响应）.
+ *
+ * 流式模式的实现路径：
+ * 1. 解析参数与鉴权校验（工作流已发布、空间权限等）。
+ * 2. 构造执行配置：SyncPattern=Stream，表示以流式方式执行；TaskType=Foreground。
+ * 3. 调用领域服务 StreamExecute 获取领域层的 StreamReader[*entity.Message]。
+ * 4. 使用 convertStreamRunEvent 将领域消息转换为 OpenAPI 层的流式事件。
+ * 5. 返回带转换器的 StreamReader 给 HTTP Handler，由其通过 SSE 持续推送给前端。
+ */
 func (w *ApplicationService) OpenAPIStreamRun(ctx context.Context, req *workflow.OpenAPIRunFlowRequest) (
 	_ *schema.StreamReader[*workflow.OpenAPIStreamRunFlowResponse], err error,
 ) {
@@ -1351,6 +1426,7 @@ func (w *ApplicationService) OpenAPIStreamRun(ctx context.Context, req *workflow
 		}
 	}()
 
+	// 1. 解析鉴权上下文与输入参数
 	apiKeyInfo := ctxutil.GetApiAuthFromCtx(ctx)
 	userID := apiKeyInfo.UserID
 
@@ -1362,6 +1438,7 @@ func (w *ApplicationService) OpenAPIStreamRun(ctx context.Context, req *workflow
 		}
 	}
 
+	// 2. 基础校验：检查工作流是否已发布、空间权限等
 	meta, err := GetWorkflowDomainSVC().Get(ctx, &vo.GetPolicy{
 		ID:       mustParseInt64(req.GetWorkflowID()),
 		MetaOnly: true,
@@ -1395,6 +1472,7 @@ func (w *ApplicationService) OpenAPIStreamRun(ctx context.Context, req *workflow
 		connectorID = apiKeyInfo.ConnectorID
 	}
 
+	// 3. 构造执行配置：指定 Stream 模式
 	exeCfg := vo.ExecuteConfig{
 		ID:            meta.ID,
 		From:          vo.FromSpecificVersion,
@@ -1415,16 +1493,26 @@ func (w *ApplicationService) OpenAPIStreamRun(ctx context.Context, req *workflow
 		return nil, errors.New("project_id and bot_id cannot be set at the same time")
 	}
 
+	// 4. 调用领域服务获取流式读取器
 	sr, err := GetWorkflowDomainSVC().StreamExecute(ctx, exeCfg, parameters)
 	if err != nil {
 		return nil, err
 	}
 
+	// 5. 包装转换器：将领域消息转换为 OpenAPI 流事件
 	convert := convertStreamRunEvent(meta.ID)
 
 	return schema.StreamReaderWithConvert(sr, convert), nil
 }
 
+/**
+ * 恢复运行被中断的工作流（流式响应）.
+ *
+ * 实现路径：
+ * 1. 从 event_id 中解析 execute_id 与 event_id，构造 ResumeRequest。
+ * 2. 调用领域服务 StreamResume 恢复执行，并返回流式读取器。
+ * 3. 继续复用 convertStreamRunEvent，将恢复执行产生的领域消息转换为 OpenAPI 流事件。
+ */
 func (w *ApplicationService) OpenAPIStreamResume(ctx context.Context, req *workflow.OpenAPIStreamResumeFlowRequest) (
 	_ *schema.StreamReader[*workflow.OpenAPIStreamRunFlowResponse], err error,
 ) {
@@ -1438,6 +1526,7 @@ func (w *ApplicationService) OpenAPIStreamResume(ctx context.Context, req *workf
 		}
 	}()
 
+	// 1. 解析恢复所需的 execute_id 与 event_id
 	idStr := req.EventID
 	idSegments := strings.Split(idStr, "/")
 	if len(idSegments) != 2 {
@@ -1469,6 +1558,7 @@ func (w *ApplicationService) OpenAPIStreamResume(ctx context.Context, req *workf
 		connectorID = mustParseInt64(req.GetConnectorID())
 	}
 
+	// 2. 调用领域服务恢复执行，获取流式读取器
 	sr, err := GetWorkflowDomainSVC().StreamResume(ctx, resumeReq, vo.ExecuteConfig{
 		Operator:     userID,
 		Mode:         vo.ExecuteModeRelease,
@@ -1480,6 +1570,7 @@ func (w *ApplicationService) OpenAPIStreamResume(ctx context.Context, req *workf
 		return nil, err
 	}
 
+	// 3. 复用事件转换器，输出 OpenAPI 层流式事件
 	convert := convertStreamRunEvent(workflowID)
 
 	return schema.StreamReaderWithConvert(sr, convert), nil

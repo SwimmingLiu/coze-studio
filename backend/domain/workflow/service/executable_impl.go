@@ -354,8 +354,32 @@ func (i *impl) AsyncExecuteNode(ctx context.Context, nodeID string, config vo.Ex
 	return executeID, nil
 }
 
-// StreamExecute executes the specified workflow, returning a stream of execution events.
-// The caller is expected to receive from the returned stream immediately.
+/**
+ * 流式执行工作流并返回实时事件流
+ *
+ * 本方法实现了异步流式工作流执行模式，结合了异步执行的高性能和流式推送的实时性。
+ * 与纯异步执行不同，流式执行会立即返回一个StreamReader，调用方可以通过它实时接收
+ * 工作流执行过程中的各种事件（状态变更、节点输出、工具调用等）。
+ *
+ * 核心特性：
+ * 1. 异步执行：工作流在后台异步执行，不阻塞调用方
+ * 2. 实时推送：通过StreamReader实时推送执行过程中的事件
+ * 3. 内存管道：使用schema.Pipe创建高效的内存通信管道
+ * 4. 事件丰富：支持状态消息、数据消息、工具调用等多种事件类型
+ * 5. 背压控制：内置缓冲区和增量传输机制防止消息堆积
+ *
+ * 适用场景：
+ * - 需要实时反馈执行进度的长时间工作流
+ * - 前端需要显示打字机效果的文本生成场景
+ * - 需要实时监控工作流执行状态的调试场景
+ * - WebSocket/SSE推送场景
+ *
+ * @param ctx 上下文对象，用于传递请求相关信息和控制执行生命周期
+ * @param config 执行配置，包含工作流ID、版本、执行模式等信息
+ * @param input 工作流输入参数，键值对形式的执行参数
+ * @return *schema.StreamReader[*entity.Message] 流式消息读取器，调用方需要立即开始接收
+ * @return error 初始化过程中的错误信息，成功时返回nil
+ */
 func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input map[string]any) (*schema.StreamReader[*entity.Message], error) {
 	var (
 		err      error
@@ -363,6 +387,8 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		ws       *nodes.ConversionWarnings
 	)
 
+	// 步骤1: 获取工作流实体定义
+	// 根据配置中的ID、版本等信息从数据库获取完整的工作流定义
 	wfEntity, err = i.Get(ctx, &vo.GetPolicy{
 		ID:       config.ID,
 		QType:    config.From,
@@ -374,6 +400,8 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		return nil, err
 	}
 
+	// 步骤2: 检查应用工作流的发布版本
+	// 如果是应用工作流且为发布模式，需要验证版本是否已正确发布
 	isApplicationWorkflow := wfEntity.AppID != nil
 	if isApplicationWorkflow && config.Mode == vo.ExecuteModeRelease {
 		err = i.checkApplicationWorkflowReleaseVersion(ctx, *wfEntity.AppID, config.ConnectorID, config.ID, config.Version)
@@ -382,33 +410,43 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		}
 	}
 
+	// 步骤3: 反序列化工作流画布定义
+	// 将数据库中存储的JSON格式画布定义反序列化为结构化对象
 	c := &vo.Canvas{}
 	if err = sonic.UnmarshalString(wfEntity.Canvas, c); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal canvas: %w", err)
 	}
 
+	// 步骤4: 将画布转换为执行引擎Schema
+	// 画布适配器将前端的可视化定义转换为后端的执行结构
 	workflowSC, err := adaptor.CanvasToWorkflowSchema(ctx, c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert canvas to workflow schema: %w", err)
 	}
 
+	// 步骤5: 构建工作流执行选项
+	// 设置工作流ID作为名称，配置节点数量限制等执行参数
 	var wfOpts []compose.WorkflowOption
 	wfOpts = append(wfOpts, compose.WithIDAsName(wfEntity.ID))
 	if s := execute.GetStaticConfig(); s != nil && s.MaxNodeCountPerWorkflow > 0 {
 		wfOpts = append(wfOpts, compose.WithMaxNodeCount(s.MaxNodeCountPerWorkflow))
 	}
 
+	// 步骤6: 创建工作流执行实例
+	// 基于Schema和选项创建可执行的工作流实例
 	wf, err := compose.NewWorkflow(ctx, workflowSC, wfOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create workflow: %w", err)
 	}
 
+	// 步骤7: 同步执行配置中的应用ID和提交ID
 	if wfEntity.AppID != nil && config.AppID == nil {
 		config.AppID = wfEntity.AppID
 	}
-
 	config.CommitID = wfEntity.CommitID
 
+	// 步骤8: 转换和验证输入参数
+	// 将用户输入转换为工作流期望的格式，并进行类型检查
 	var cOpts []nodes.ConvertOption
 	if config.InputFailFast {
 		cOpts = append(cOpts, nodes.FailFast())
@@ -421,23 +459,34 @@ func (i *impl) StreamExecute(ctx context.Context, config vo.ExecuteConfig, input
 		logs.CtxWarnf(ctx, "convert inputs warnings: %v", *ws)
 	}
 
+	// 步骤9: 序列化输入参数为JSON字符串
+	// 用于传递给底层执行引擎和记录到数据库
 	inStr, err := sonic.MarshalString(input)
 	if err != nil {
 		return nil, err
 	}
 
+	// 步骤10: 创建流式通信管道
+	// sr (StreamReader) 返回给调用方用于接收消息
+	// sw (StreamWriter) 传递给执行引擎用于推送消息
+	// 缓冲区大小为10，平衡内存使用和响应性能
 	sr, sw := schema.Pipe[*entity.Message](10)
 
+	// 步骤11: 准备工作流执行环境
+	// 创建WorkflowRunner并进行执行前的各种准备工作
 	cancelCtx, executeID, opts, _, err := compose.NewWorkflowRunner(wfEntity.GetBasic(), workflowSC, config,
 		compose.WithInput(inStr), compose.WithStreamWriter(sw)).Prepare(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	_ = executeID
+	_ = executeID // 执行ID用于调试和日志记录
 
+	// 步骤12: 启动异步工作流执行
+	// 工作流在后台异步执行，执行过程中的事件会通过StreamWriter推送到StreamReader
 	wf.AsyncRun(cancelCtx, input, opts...)
 
+	// 步骤13: 立即返回StreamReader供调用方接收实时消息
 	return sr, nil
 }
 

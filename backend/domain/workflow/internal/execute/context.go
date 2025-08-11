@@ -35,23 +35,23 @@ import (
 )
 
 type Context struct {
-	RootCtx
+	RootCtx // 根工作流运行态（工作流基线、执行ID、恢复点、执行配置）
 
-	*SubWorkflowCtx
+	*SubWorkflowCtx // 子工作流运行态（当处于子流程内时携带）
 
-	*NodeCtx
+	*NodeCtx // 当前节点运行态（节点Key/类型/路径/退出策略等）
 
-	*BatchInfo
+	*BatchInfo // 批处理上下文（索引/复合节点Key/Items）
 
-	TokenCollector *TokenCollector
+	TokenCollector *TokenCollector // token 统计收集器，支持父子聚合（用于费控/审计）
 
-	StartTime int64 // UnixMilli
+	StartTime int64 // UnixMilli（用于计算节点/工作流耗时）
 
-	CheckPointID string
+	CheckPointID string // 持久化断点ID（用于中断恢复、并发路径的精确定位）
 
-	AppVarStore *AppVariables
+	AppVarStore *AppVariables // 应用级变量存取（线程安全）
 
-	executed *atomic.Int64
+	executed *atomic.Int64 // 已执行节点计数（配合 maxNodeCountPerExecution 进行限流）
 }
 
 type RootCtx struct {
@@ -232,10 +232,10 @@ func PrepareRootExeCtx(ctx context.Context, h *WorkflowHandler) (context.Context
 			ExeCfg:            h.exeCfg,
 		},
 
-		TokenCollector: newTokenCollector(fmt.Sprintf("wf_%d", h.rootWorkflowBasic.ID), parentTokenCollector),
+		TokenCollector: newTokenCollector(fmt.Sprintf("wf_%d", h.rootWorkflowBasic.ID), parentTokenCollector), // 根Collector
 		StartTime:      time.Now().UnixMilli(),
-		AppVarStore:    NewAppVariables(),
-		executed:       ptr.Of(atomic.Int64{}),
+		AppVarStore:    NewAppVariables(),      // 共享至子/节点层
+		executed:       ptr.Of(atomic.Int64{}), // 节点计数器
 	}
 
 	if h.requireCheckpoint {
@@ -268,13 +268,13 @@ func PrepareSubExeCtx(ctx context.Context, wb *entity.WorkflowBasic, requireChec
 		return ctx, nil
 	}
 
-	subExecuteID, err := workflow.GetRepository().GenID(ctx)
+	subExecuteID, err := workflow.GetRepository().GenID(ctx) // 子流程独立执行ID（便于观测/恢复）
 	if err != nil {
 		return nil, err
 	}
 
 	var newCheckpointID string
-	if len(c.CheckPointID) > 0 {
+	if len(c.CheckPointID) > 0 { // 断点链路：父→子，形成可回溯路径
 		newCheckpointID = c.CheckPointID + "_" + strconv.FormatInt(subExecuteID, 10)
 	}
 
@@ -286,7 +286,7 @@ func PrepareSubExeCtx(ctx context.Context, wb *entity.WorkflowBasic, requireChec
 		},
 		NodeCtx:        c.NodeCtx,
 		BatchInfo:      c.BatchInfo,
-		TokenCollector: newTokenCollector(fmt.Sprintf("sub_wf_%d", wb.ID), c.TokenCollector),
+		TokenCollector: newTokenCollector(fmt.Sprintf("sub_wf_%d", wb.ID), c.TokenCollector), // Collector 级联
 		CheckPointID:   newCheckpointID,
 		StartTime:      time.Now().UnixMilli(),
 		AppVarStore:    c.AppVarStore,
@@ -315,7 +315,7 @@ func PrepareNodeExeCtx(ctx context.Context, nodeKey vo.NodeKey, nodeName string,
 	if c == nil {
 		return ctx, nil
 	}
-	nodeExecuteID, err := workflow.GetRepository().GenID(ctx)
+	nodeExecuteID, err := workflow.GetRepository().GenID(ctx) // 节点执行ID（用于精确审计与并行路径追踪）
 	if err != nil {
 		return nil, err
 	}
@@ -337,18 +337,19 @@ func PrepareNodeExeCtx(ctx context.Context, nodeKey vo.NodeKey, nodeName string,
 		executed:     c.executed,
 	}
 
-	if c.NodeCtx == nil { // node within top level workflow, also not under composite node
+	if c.NodeCtx == nil { // 顶层节点（不在复合节点内）
 		newC.NodeCtx.NodePath = []string{string(nodeKey)}
 	} else {
-		if c.BatchInfo == nil {
+		if c.BatchInfo == nil { // 普通子路径
 			newC.NodeCtx.NodePath = append(c.NodeCtx.NodePath, string(nodeKey))
 		} else {
+			// 批处理路径在 NodePath 中插入索引，保证中断恢复时可精确定位到“第N批第K个节点”
 			newC.NodeCtx.NodePath = append(c.NodeCtx.NodePath, InterruptEventIndexPrefix+strconv.Itoa(c.BatchInfo.Index), string(nodeKey))
 		}
 	}
 
 	tc := c.TokenCollector
-	if entity.NodeMetaByNodeType(nodeType).MayUseChatModel {
+	if entity.NodeMetaByNodeType(nodeType).MayUseChatModel { // 仅对“可能产出 tokens 的节点”新建 Collector
 		tc = newTokenCollector(strings.Join(append([]string{string(newC.NodeType)}, newC.NodeCtx.NodePath...), "."), c.TokenCollector)
 	}
 	newC.TokenCollector = tc

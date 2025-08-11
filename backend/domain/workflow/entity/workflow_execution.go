@@ -26,6 +26,11 @@ import (
 type WorkflowExecuteStatus workflow.WorkflowExeStatus
 type NodeExecuteStatus workflow.NodeExeStatus
 
+// WorkflowExecution 表示一次工作流执行的元信息与最终态。
+// 异步策略要点：
+// - Status 支持 Running/Success/Fail/Cancel/Interrupted（中断可恢复）。
+// - TokenInfo 汇总自各节点 TokenCollector（含流式聚合）。
+// - InterruptEvents 存储于独立表，但这里通过 NodeExecutions/CurrentResumingEventID 关联恢复点。
 type WorkflowExecution struct {
 	ID         int64
 	WorkflowID int64
@@ -37,22 +42,22 @@ type WorkflowExecution struct {
 	NodeCount int32
 	CommitID  string
 
-	Status     WorkflowExecuteStatus
-	Duration   time.Duration
-	Input      *string
-	Output     *string
-	ErrorCode  *string
-	FailReason *string
-	TokenInfo  *TokenUsage
-	UpdatedAt  *time.Time
+	Status     WorkflowExecuteStatus // 运行态：Running/Success/Fail/Cancel/Interrupted（中断可 Resume）
+	Duration   time.Duration         // 总耗时（根工作流级别）
+	Input      *string               // 归档输入（JSON 字符串）
+	Output     *string               // 归档输出（JSON 字符串）
+	ErrorCode  *string               // 标准化错误码（失败/取消等）
+	FailReason *string               // 失败摘要（最多 1000 字，用于快速定位）
+	TokenInfo  *TokenUsage           // Token 统计（由 TokenCollector 异步流式汇总）
+	UpdatedAt  *time.Time            // 更新时间（幂等写入用）
 
-	ParentNodeID           *string
-	ParentNodeExecuteID    *int64
-	NodeExecutions         []*NodeExecution
-	RootExecutionID        int64
-	CurrentResumingEventID *int64
+	ParentNodeID           *string          // 若为子工作流，记录父节点信息
+	ParentNodeExecuteID    *int64           // 子执行与父节点执行的绑定
+	NodeExecutions         []*NodeExecution // 该执行下所有节点执行记录（含流式增量写入）
+	RootExecutionID        int64            // 根执行ID（子流程用于关联）
+	CurrentResumingEventID *int64           // 当前恢复点事件ID（并发中断时精确恢复）
 
-	InterruptEvents []*InterruptEvent
+	InterruptEvents []*InterruptEvent // 回放/查询场景中可附带的中断事件快照
 }
 
 const (
@@ -74,6 +79,10 @@ type TokenUsage struct {
 	OutputTokens int64
 }
 
+// NodeExecution 表示单节点一次执行过程的快照。
+// 异步策略：
+// - 流式场景下使用 UpdateNodeExecutionStreaming 增量写入 Output。
+// - Extra.ResponseExtra 可携带 reasoning/terminal_plan 等信息，避免频繁序列化全量对象。
 type NodeExecution struct {
 	ID        int64
 	ExecuteID int64

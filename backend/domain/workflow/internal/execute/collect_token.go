@@ -36,6 +36,9 @@ type TokenCollector struct {
 	Parent *TokenCollector
 }
 
+// newTokenCollector 建立“父子聚合”的 Token 统计器：
+// - 子节点完成时，将 token 累加到父 Collector，最终在工作流成功/失败统一结算。
+// - 流式路径下使用 OnEndWithStreamOutput 聚合增量，避免小碎片多次锁竞争。
 func newTokenCollector(key string, parent *TokenCollector) *TokenCollector {
 	return &TokenCollector{
 		Key:    key,
@@ -44,6 +47,7 @@ func newTokenCollector(key string, parent *TokenCollector) *TokenCollector {
 	}
 }
 
+// addTokenUsage 将本次增量累加至自身与父 Collector，支持树状聚合。
 func (t *TokenCollector) addTokenUsage(usage *model.TokenUsage) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -56,6 +60,7 @@ func (t *TokenCollector) addTokenUsage(usage *model.TokenUsage) {
 	}
 }
 
+// wait 等待所有子任务完成后，安全返回累计用量快照。
 func (t *TokenCollector) wait() *model.TokenUsage {
 	t.wg.Wait()
 	t.mu.Lock()

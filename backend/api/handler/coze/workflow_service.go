@@ -917,12 +917,18 @@ func convertStreamRunData(msg *workflow.OpenAPIStreamRunFlowResponse) *streamRun
 	}
 }
 
+// sendStreamRunSSE 将后端流式执行的增量消息转换为 SSE 事件：
+// - 按事件类型透传（data/state/tool/interrupt），前端可直接渲染打字机与进度态；
+// - 出错时即时发送 error 事件并终止，防止客户端长连挂起堆积；
+// - writer/reader 均在结束时关闭，避免 FD/内存泄露。
 func sendStreamRunSSE(ctx context.Context, w *sse.Writer, sr *schema.StreamReader[*workflow.OpenAPIStreamRunFlowResponse]) {
 	defer func() {
 		_ = w.Close()
 		sr.Close()
 	}()
 
+	// SSE 推送端：按事件类型(data/state/tool/interrupt)透传；
+	// 出错即发送 error 并终止，避免客户端长连挂起导致堆积。
 	for {
 		msg, err := sr.Recv()
 		if err != nil {

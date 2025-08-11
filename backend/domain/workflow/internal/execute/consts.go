@@ -22,11 +22,16 @@ import (
 )
 
 const (
-	foregroundRunTimeout     = 0 // timeout for workflow execution in foreground mode, 0 means no timeout
-	backgroundRunTimeout     = 0 // timeout for workflow execution in background mode, 0 means no timeout
-	maxNodeCountPerWorkflow  = 0 // maximum node count for a workflow, 0 means no limit
-	maxNodeCountPerExecution = 0 // maximum node count for a workflow execution, 0 means no limit
-	cancelCheckInterval      = 200 * time.Millisecond
+	// 前台执行超时（0 表示不设超时，由调用方控制生命周期）
+	foregroundRunTimeout = 0
+	// 后台执行超时（0 表示不设超时，交给调度与取消标记）
+	backgroundRunTimeout = 0
+	// 单个工作流最大节点数（0 表示不限制，依赖其他风控与资源限额）
+	maxNodeCountPerWorkflow = 0
+	// 单次执行最大节点数（0 表示不限制；当 >0 时结合 executed 计数进行短路保护）
+	maxNodeCountPerExecution = 0
+	// 取消轮询周期（异步可取消：周期性检查 Redis 标记以触发 cancelFn）
+	cancelCheckInterval = 200 * time.Millisecond
 )
 
 type StaticConfig struct {
@@ -49,6 +54,9 @@ const (
 	executedNodeCountKey = "executed_node_count"
 )
 
+// IncrementAndCheckExecutedNodes 原子自增“已执行节点数”，并返回是否超过阈值。
+// 可用于异步执行中的“软限流/快速失败”，防止超大图在单次执行中产生堆积。
+// 结合 HandleExecuteEvent 的事件消费循环与流式增量去抖，可形成端到端的背压保护。
 func IncrementAndCheckExecutedNodes(ctx context.Context) (int64, bool) {
 	exeCtx := GetExeCtx(ctx)
 	if exeCtx == nil {
