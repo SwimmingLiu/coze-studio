@@ -831,16 +831,36 @@ func preprocessWorkflowRequestBody(_ context.Context, c *app.RequestContext) err
 	return nil
 }
 
+/**
+ * OpenAPIRunFlow 工作流执行的外部API入口
+ *
+ * 该接口是工作流发布后供外部系统调用的核心API，通过API连接器提供服务。
+ * 客户端通过此接口可以执行已发布的工作流版本，支持同步和异步两种执行模式。
+ *
+ * 执行流程：
+ * 1. 预处理请求参数，标准化参数格式
+ * 2. 验证请求参数的完整性和有效性
+ * 3. 调用工作流应用服务执行具体逻辑
+ * 4. 处理执行结果和错误信息
+ * 5. 返回标准化的API响应
+ *
+ * @router /v1/workflow/run [POST]
+ * @param ctx 请求上下文，包含用户认证、超时控制等信息
+ * @param c Hertz框架的请求上下文，用于参数解析和响应处理
+ */
 // OpenAPIRunFlow .
 // @router /v1/workflow/run [POST]
 func OpenAPIRunFlow(ctx context.Context, c *app.RequestContext) {
 	var err error
 
+	/* 第一步：预处理工作流请求参数 */
+	/* 标准化参数格式，确保参数结构符合内部处理要求 */
 	if err = preprocessWorkflowRequestBody(ctx, c); err != nil {
 		invalidParamRequestResponse(c, err.Error())
 		return
 	}
 
+	/* 第二步：绑定和验证请求参数 */
 	var req workflow.OpenAPIRunFlowRequest
 	err = c.BindAndValidate(&req)
 	if err != nil {
@@ -848,14 +868,17 @@ func OpenAPIRunFlow(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	/* 第三步：调用工作流应用服务执行工作流 */
+	/* 这里会进行版本查找、权限验证、工作流引擎调用等核心逻辑 */
 	resp, err := appworkflow.SVC.OpenAPIRun(ctx, &req)
 	if err != nil {
+		/* 处理工作流特定的业务错误 */
 		var se vo.WorkflowError
 		if errors.As(err, &se) {
 			resp = new(workflow.OpenAPIRunFlowResponse)
-			resp.Code = int64(se.OpenAPICode())
-			resp.Msg = ptr.Of(se.Msg())
-			debugURL := se.DebugURL()
+			resp.Code = int64(se.OpenAPICode()) /* 业务错误码 */
+			resp.Msg = ptr.Of(se.Msg())         /* 错误信息 */
+			debugURL := se.DebugURL()           /* 调试链接 */
 			if debugURL != "" {
 				resp.DebugUrl = ptr.Of(debugURL)
 			}
@@ -863,10 +886,12 @@ func OpenAPIRunFlow(ctx context.Context, c *app.RequestContext) {
 			return
 		}
 
+		/* 处理系统级错误 */
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	/* 第四步：返回执行结果 */
 	c.JSON(consts.StatusOK, resp)
 }
 

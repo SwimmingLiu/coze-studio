@@ -66,44 +66,44 @@ func validateWorkflowTree(ctx context.Context, config vo.ValidateTreeConfig) ([]
 
 	var issues []*validate.Issue
 
-	// 4. 验证节点连接关系的有效性
-	// 检查节点之间的输入输出连接是否正确，数据类型是否匹配
+	/* 第四步：验证节点连接关系的有效性 */
+	/* 检查节点之间的输入输出连接是否正确，数据类型是否匹配 */
 	issues, err = validator.ValidateConnections(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check connectivity : %w", err)
 	}
 	if len(issues) > 0 {
-		return issues, nil
+		return issues, nil /* 连接验证失败，直接返回问题 */
 	}
 
-	// 5. 检测工作流中是否存在循环依赖
-	// 防止工作流执行时出现无限循环的情况
+	/* 第五步：检测工作流中是否存在循环依赖 */
+	/* 防止工作流执行时出现无限循环的情况 */
 	issues, err = validator.DetectCycles(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check loops: %w", err)
 	}
 	if len(issues) > 0 {
-		return issues, nil
+		return issues, nil /* 循环依赖检测失败，直接返回问题 */
 	}
 
-	// 6. 验证嵌套流程的合法性
-	// 检查批处理节点和递归节点的嵌套结构是否符合规范
+	/* 第六步：验证嵌套流程的合法性 */
+	/* 检查批处理节点和递归节点的嵌套结构是否符合规范 */
 	issues, err = validator.ValidateNestedFlows(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check nested batch or recurse: %w", err)
 	}
 	if len(issues) > 0 {
-		return issues, nil
+		return issues, nil /* 嵌套流程验证失败，直接返回问题 */
 	}
 
-	// 7. 检查引用变量的可达性和有效性
-	// 确保节点中引用的变量在执行时能够正确获取到值
+	/* 第七步：检查引用变量的可达性和有效性 */
+	/* 确保节点中引用的变量在执行时能够正确获取到值 */
 	issues, err = validator.CheckRefVariable(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check ref variable: %w", err)
 	}
 	if len(issues) > 0 {
-		return issues, nil
+		return issues, nil /* 变量引用验证失败，直接返回问题 */
 	}
 
 	// 8. 验证全局变量的定义和使用

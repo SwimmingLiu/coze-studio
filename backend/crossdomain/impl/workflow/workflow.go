@@ -57,7 +57,19 @@ func (i *impl) DeleteWorkflow(ctx context.Context, id int64) error {
 	})
 }
 
+/**
+ * ReleaseApplicationWorkflows 跨域工作流服务的发布入口
+ *
+ * 该方法作为跨域服务层的适配器，负责将应用发布请求转发给工作流领域服务。
+ * 跨域服务层的主要作用是提供统一的服务接口，屏蔽不同领域服务的实现细节。
+ *
+ * @param ctx 上下文信息
+ * @param appID 应用ID
+ * @param config 工作流发布配置
+ * @return 验证问题列表和错误信息
+ */
 func (i *impl) ReleaseApplicationWorkflows(ctx context.Context, appID int64, config *vo.ReleaseWorkflowConfig) ([]*vo.ValidateIssue, error) {
+	/* 直接委托给工作流领域服务执行具体的发布逻辑 */
 	return i.DomainSVC.ReleaseApplicationWorkflows(ctx, appID, config)
 }
 

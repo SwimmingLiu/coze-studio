@@ -86,7 +86,7 @@ func (i *impl) ListNodeMeta(_ context.Context, nodeTypes map[entity.NodeType]boo
 			return false
 		}
 		nodeType := meta.Key
-		if nodeTypes == nil || len(nodeTypes) == 0 {
+		if len(nodeTypes) == 0 {
 			return true // No filter, include all
 		}
 		_, ok := nodeTypes[nodeType]
@@ -769,128 +769,172 @@ func (i *impl) CopyWorkflow(ctx context.Context, workflowID int64, policy vo.Cop
 
 }
 
+/**
+ * ReleaseApplicationWorkflows 发布应用的所有工作流
+ *
+ * 该方法是工作流打包发布的核心实现，负责将应用的草稿工作流发布为正式版本。
+ * 整个过程包括工作流验证、资源引用替换、版本创建、连接器关联等关键步骤。
+ *
+ * 发布流程：
+ * 1. 获取应用的所有草稿工作流
+ * 2. 逐一验证工作流的合法性(连接关系、循环依赖、嵌套流程等)
+ * 3. 替换工作流中的外部资源引用为发布版本
+ * 4. 为每个工作流创建发布版本记录
+ * 5. 建立连接器与工作流版本的关联关系
+ *
+ * @param ctx 上下文信息
+ * @param appID 应用ID，用于获取该应用下的所有工作流
+ * @param config 发布配置，包含版本号、插件ID列表、连接器ID列表等
+ * @return vIssues 验证问题列表，如果为空则表示发布成功
+ * @return err 发布过程中的错误信息
+ */
 func (i *impl) ReleaseApplicationWorkflows(ctx context.Context, appID int64, config *vo.ReleaseWorkflowConfig) ([]*vo.ValidateIssue, error) {
+	/* 前置检查：确保连接器ID列表不为空 */
 	if len(config.ConnectorIDs) == 0 {
 		return nil, fmt.Errorf("connector ids is required")
 	}
 
+	/* 第一阶段：获取应用的所有草稿工作流 */
 	wfs, _, err := i.MGet(ctx, &vo.MGetPolicy{
 		MetaQuery: vo.MetaQuery{
-			AppID: &appID,
+			AppID: &appID, /* 根据应用ID过滤工作流 */
 		},
-		QType: vo.FromDraft,
+		QType: vo.FromDraft, /* 只获取草稿状态的工作流 */
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	/* 第二阶段：构建资源引用映射关系 */
+	/* 构建插件引用映射，用于后续替换工作流中的插件引用 */
 	relatedPlugins := make(map[int64]*vo.PluginEntity, len(config.PluginIDs))
+	/* 构建工作流引用映射，用于子工作流引用替换 */
 	relatedWorkflow := make(map[int64]entity.IDVersionPair, len(wfs))
 
+	/* 为每个工作流建立版本映射关系 */
 	for _, wf := range wfs {
 		relatedWorkflow[wf.ID] = entity.IDVersionPair{
 			ID:      wf.ID,
-			Version: config.Version,
+			Version: config.Version, /* 设置为当前发布版本 */
 		}
 	}
+	/* 为每个插件建立版本映射关系 */
 	for _, id := range config.PluginIDs {
 		relatedPlugins[id] = &vo.PluginEntity{
 			PluginID:      id,
-			PluginVersion: &config.Version,
+			PluginVersion: &config.Version, /* 设置为当前发布版本 */
 		}
 	}
 
+	/* 第三阶段：工作流验证 - 确保所有工作流都符合发布标准 */
 	vIssues := make([]*vo.ValidateIssue, 0)
 	for _, wf := range wfs {
+		/* 对每个工作流进行全面验证 */
 		issues, err := validateWorkflowTree(ctx, vo.ValidateTreeConfig{
-			CanvasSchema: wf.Canvas,
-			AppID:        ptr.Of(appID),
+			CanvasSchema: wf.Canvas,     /* 工作流的画布结构 */
+			AppID:        ptr.Of(appID), /* 应用ID，用于变量验证等 */
 		})
 
 		if err != nil {
 			return nil, err
 		}
 
+		/* 如果存在验证问题，收集到问题列表中 */
 		if len(issues) > 0 {
 			vIssues = append(vIssues, toValidateIssue(wf.ID, wf.Name, issues))
 		}
-
 	}
+
+	/* 如果存在验证问题，直接返回，不继续发布流程 */
 	if len(vIssues) > 0 {
 		return vIssues, nil
 	}
 
+	/* 第四阶段：资源引用替换 - 将草稿引用替换为发布版本引用 */
 	for _, wf := range wfs {
+		/* 解析工作流的Canvas结构 */
 		c := &vo.Canvas{}
 		err := sonic.UnmarshalString(wf.Canvas, c)
 		if err != nil {
 			return nil, err
 		}
 
+		/* 替换工作流节点中的外部资源引用 */
 		err = replaceRelatedWorkflowOrExternalResourceInWorkflowNodes(c.Nodes, relatedWorkflow, vo.ExternalResourceRelated{
-			PluginMap: relatedPlugins,
+			PluginMap: relatedPlugins, /* 插件引用映射 */
 		})
 
 		if err != nil {
 			return nil, err
 		}
 
+		/* 重新序列化更新后的Canvas结构 */
 		canvasSchema, err := sonic.MarshalString(c)
 		if err != nil {
 			return nil, err
 		}
-		wf.Canvas = canvasSchema
-
+		wf.Canvas = canvasSchema /* 更新工作流的Canvas数据 */
 	}
 
+	/* 第五阶段：准备版本创建数据 */
 	userID := ctxutil.MustGetUIDFromCtx(ctx)
 
+	/* 构建待发布工作流的版本信息映射 */
 	workflowsToPublish := make(map[int64]*vo.VersionInfo)
 	for _, wf := range wfs {
+		/* 序列化工作流的输入参数 */
 		inputStr, err := sonic.MarshalString(wf.InputParams)
 		if err != nil {
 			return nil, err
 		}
 
+		/* 序列化工作流的输出参数 */
 		outputStr, err := sonic.MarshalString(wf.OutputParams)
 		if err != nil {
 			return nil, err
 		}
 
+		/* 构建完整的版本信息对象 */
 		workflowsToPublish[wf.ID] = &vo.VersionInfo{
 			VersionMeta: &vo.VersionMeta{
-				Version:          config.Version,
-				VersionCreatorID: userID,
+				Version:          config.Version, /* 发布版本号 */
+				VersionCreatorID: userID,         /* 版本创建者ID */
 			},
 			CanvasInfo: vo.CanvasInfo{
-				Canvas:          wf.Canvas,
-				InputParamsStr:  inputStr,
-				OutputParamsStr: outputStr,
+				Canvas:          wf.Canvas, /* 更新后的画布结构 */
+				InputParamsStr:  inputStr,  /* 输入参数JSON字符串 */
+				OutputParamsStr: outputStr, /* 输出参数JSON字符串 */
 			},
-			CommitID: wf.CommitID,
+			CommitID: wf.CommitID, /* 工作流的提交ID */
 		}
 	}
 
+	/* 第六阶段：创建工作流版本记录 */
 	workflowIDs := make([]int64, 0, len(wfs))
 	for id, vInfo := range workflowsToPublish {
+		/* 解析工作流的引用关系，用于依赖管理 */
 		wfRefs, err := canvasToRefs(id, vInfo.Canvas)
 		if err != nil {
 			return nil, err
 		}
 
 		workflowIDs = append(workflowIDs, id)
+		/* 在数据库中创建工作流版本记录 */
 		if err = i.repo.CreateVersion(ctx, id, vInfo, wfRefs); err != nil {
 			return nil, err
 		}
 	}
 
+	/* 第七阶段：建立连接器与工作流版本的关联关系 */
 	for _, connectorID := range config.ConnectorIDs {
+		/* 为每个连接器批量创建与工作流版本的关联记录 */
 		err = i.repo.BatchCreateConnectorWorkflowVersion(ctx, appID, connectorID, workflowIDs, config.Version)
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	/* 发布成功，返回空的问题列表 */
 	return nil, nil
 }
 
@@ -1304,10 +1348,6 @@ func (i *impl) DuplicateWorkflowsByAppID(ctx context.Context, sourceAppID, targe
 				TargetAppID:          ptr.Of(targetAppID),
 				ModifiedCanvasSchema: ptr.Of(modifiedCanvasString),
 			})
-			if err != nil {
-				return err
-			}
-
 			if err != nil {
 				return err
 			}

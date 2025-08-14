@@ -234,17 +234,36 @@ func CheckProjectVersionNumber(ctx context.Context, c *app.RequestContext) {
 	c.JSON(consts.StatusOK, resp)
 }
 
-// PublishProject .
-// @router /api/intelligence_api/publish/publish_project [POST]
+/**
+ * PublishProject 发布项目到指定连接器
+ *
+ * 该接口负责将草稿项目发布为正式版本，支持发布到多种连接器(如API连接器)。
+ * 发布过程包括：参数验证、权限检查、资源打包、版本创建、状态更新等步骤。
+ *
+ * 业务流程：
+ * 1. 验证请求参数的有效性(项目ID、版本号等)
+ * 2. 检查用户对项目的访问权限
+ * 3. 打包项目相关资源(插件、工作流等)
+ * 4. 创建发布记录并更新项目状态
+ * 5. 发布成功后触发搜索索引更新事件
+ *
+ * @router /api/intelligence_api/publish/publish_project [POST]
+ * @param ctx 请求上下文，包含用户身份等信息
+ * @param c Hertz框架的请求上下文，用于参数绑定和响应处理
+ * @return 返回发布记录ID，客户端可用此ID查询发布状态
+ */
 func PublishProject(ctx context.Context, c *app.RequestContext) {
 	var err error
 	var req publish.PublishProjectRequest
+
+	/* 第一步：请求参数绑定与基础验证 */
 	err = c.BindAndValidate(&req)
 	if err != nil {
 		invalidParamRequestResponse(c, err.Error())
 		return
 	}
 
+	/* 第二步：业务参数有效性检查 */
 	if req.ProjectID <= 0 {
 		invalidParamRequestResponse(c, "invalid project id")
 		return
@@ -254,12 +273,14 @@ func PublishProject(ctx context.Context, c *app.RequestContext) {
 		return
 	}
 
+	/* 第三步：调用应用服务层执行核心发布逻辑 */
 	resp, err := appApplication.APPApplicationSVC.PublishAPP(ctx, &req)
 	if err != nil {
 		internalServerErrorResponse(ctx, c, err)
 		return
 	}
 
+	/* 第四步：返回发布结果给客户端 */
 	c.JSON(consts.StatusOK, resp)
 }
 

@@ -405,21 +405,43 @@ func (a *APPApplicationService) CheckProjectVersionNumber(ctx context.Context, r
 	return resp, nil
 }
 
+/**
+ * PublishAPP 应用服务层的项目发布核心方法
+ *
+ * 该方法是项目发布功能的应用服务层入口，负责协调各个领域服务完成项目发布。
+ * 主要职责包括：权限验证、配置处理、领域服务调用、事件发布等。
+ *
+ * 处理流程：
+ * 1. 验证用户对草稿项目的访问权限
+ * 2. 解析和验证连接器发布配置
+ * 3. 调用领域服务执行核心发布逻辑
+ * 4. 发布成功时触发项目更新事件通知搜索服务
+ *
+ * @param ctx 上下文，包含用户身份、请求ID等信息
+ * @param req 发布项目请求，包含项目ID、版本号、连接器配置等
+ * @return resp 发布响应，包含发布记录ID用于后续状态查询
+ * @return err 错误信息，发布失败时返回具体错误原因
+ */
 func (a *APPApplicationService) PublishAPP(ctx context.Context, req *publishAPI.PublishProjectRequest) (resp *publishAPI.PublishProjectResponse, err error) {
+	/* 第一步：权限验证 - 确保用户有权限操作该草稿项目 */
 	_, err = a.ValidateDraftAPPAccess(ctx, req.ProjectID)
 	if err != nil {
 		return nil, errorx.Wrapf(err, "ValidateDraftAPPAccess failed, id=%d", req.ProjectID)
 	}
 
+	/* 第二步：连接器配置预处理 - 提取连接器ID列表 */
 	connectorIDs := make([]int64, 0, len(req.Connectors))
 	for connectorID := range req.Connectors {
 		connectorIDs = append(connectorIDs, connectorID)
 	}
+
+	/* 第三步：构建连接器发布配置映射 */
 	connectorPublishConfigs, err := a.getConnectorPublishConfigs(ctx, connectorIDs, req.ConnectorPublishConfig)
 	if err != nil {
 		return nil, err
 	}
 
+	/* 第四步：调用领域服务执行核心发布逻辑 */
 	res, err := a.DomainSVC.PublishAPP(ctx, &service.PublishAPPRequest{
 		APPID:                   req.ProjectID,
 		Version:                 req.VersionNumber,
@@ -430,55 +452,87 @@ func (a *APPApplicationService) PublishAPP(ctx context.Context, req *publishAPI.
 		return nil, errorx.Wrapf(err, "PublishAPP failed, id=%d", req.ProjectID)
 	}
 
+	/* 第五步：构建响应对象 */
 	resp = &publishAPI.PublishProjectResponse{
 		Data: &publishAPI.PublishProjectData{
-			PublishRecordID: res.PublishRecordID,
+			PublishRecordID: res.PublishRecordID, /* 返回发布记录ID供客户端查询状态 */
 		},
 	}
 
+	/* 第六步：发布失败时直接返回，不触发后续事件 */
 	if !res.Success {
 		return resp, nil
 	}
 
+	/* 第七步：发布成功后触发项目更新事件 - 通知搜索服务更新索引 */
 	err = a.projectEventBus.PublishProject(ctx, &searchEntity.ProjectDomainEvent{
 		OpType: searchEntity.Updated,
 		Project: &searchEntity.ProjectDocument{
 			ID:            req.ProjectID,
 			Type:          common.IntelligenceType_Project,
-			HasPublished:  ptr.Of(1),
-			PublishTimeMS: ptr.Of(time.Now().UnixMilli()),
+			HasPublished:  ptr.Of(1),                      /* 标记项目已发布 */
+			PublishTimeMS: ptr.Of(time.Now().UnixMilli()), /* 记录发布时间戳 */
 		},
 	})
 	if err != nil {
+		/* 事件发布失败不影响主流程，只记录错误日志 */
 		logs.CtxErrorf(ctx, "publish project '%d' failed,  err=%v", req.ProjectID, err)
 	}
 
 	return resp, nil
 }
 
+/**
+ * getConnectorPublishConfigs 构建连接器发布配置映射
+ *
+ * 该方法将API请求中的连接器配置转换为领域层所需的发布配置格式。
+ * 主要处理工作流选择配置，验证工作流ID的有效性，构建连接器到发布配置的映射关系。
+ *
+ * 配置转换逻辑：
+ * 1. 为每个连接器创建默认的发布配置
+ * 2. 解析请求中的工作流选择配置
+ * 3. 验证工作流ID的有效性
+ * 4. 构建最终的配置映射
+ *
+ * @param ctx 上下文信息
+ * @param connectorIDs 连接器ID列表
+ * @param configs API层传入的连接器配置映射
+ * @return publishConfigs 领域层所需的发布配置映射
+ * @return error 配置转换过程中的错误，如工作流ID无效
+ */
 func (a *APPApplicationService) getConnectorPublishConfigs(ctx context.Context, connectorIDs []int64, configs map[int64]*publishAPI.ConnectorPublishConfig) (map[int64]entity.PublishConfig, error) {
+	/* 初始化发布配置映射，为每个连接器分配空间 */
 	publishConfigs := make(map[int64]entity.PublishConfig, len(configs))
+
+	/* 遍历所有连接器ID，构建发布配置 */
 	for _, connectorID := range connectorIDs {
+		/* 为每个连接器创建默认配置 */
 		publishConfigs[connectorID] = entity.PublishConfig{}
 
+		/* 获取该连接器的具体配置 */
 		config := configs[connectorID]
 		if config == nil {
-			continue
+			continue /* 该连接器无特殊配置，使用默认配置 */
 		}
 
+		/* 处理工作流选择配置 */
 		selectedWorkflows := make([]*entity.SelectedWorkflow, 0, len(config.SelectedWorkflows))
 		for _, w := range config.SelectedWorkflows {
+			/* 验证工作流ID有效性 */
 			if w.WorkflowID == 0 {
 				return nil, errorx.New(errno.ErrAppInvalidParamCode, errorx.KV(errno.APPMsgKey, "invalid workflow id"))
 			}
+
+			/* 构建工作流选择配置 */
 			selectedWorkflows = append(selectedWorkflows, &entity.SelectedWorkflow{
-				WorkflowID:   w.WorkflowID,
-				WorkflowName: w.WorkflowName,
+				WorkflowID:   w.WorkflowID,   /* 工作流唯一标识 */
+				WorkflowName: w.WorkflowName, /* 工作流显示名称 */
 			})
 		}
 
+		/* 更新连接器的完整发布配置 */
 		publishConfigs[connectorID] = entity.PublishConfig{
-			SelectedWorkflows: selectedWorkflows,
+			SelectedWorkflows: selectedWorkflows, /* 该连接器选择发布的工作流列表 */
 		}
 	}
 
